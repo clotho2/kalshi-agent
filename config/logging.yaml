@@ -1,0 +1,29 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  json:
+    (): structlog.stdlib.ProcessorFormatter
+    processor:
+      (): structlog.processors.JSONRenderer
+  console:
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: console
+    level: INFO
+  file:
+    class: logging.handlers.TimedRotatingFileHandler
+    formatter: json
+    filename: /var/log/kalshi-agent/agent.jsonl
+    when: midnight
+    interval: 1
+    backupCount: 90
+    encoding: utf-8
+    level: INFO
+
+root:
+  level: INFO
+  handlers: [console, file]

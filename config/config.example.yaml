@@ -1,0 +1,80 @@
+# Kalshi agent configuration. Secrets do NOT live here — see .env.example.
+
+mode: paper  # paper | live. Live requires explicit --mode live override.
+
+kalshi:
+  base_url_paper: https://demo-api.kalshi.co/trade-api/v2
+  base_url_live: https://api.elections.kalshi.com/trade-api/v2
+  ws_url_paper: wss://demo-api.kalshi.co/trade-api/ws/v2
+  ws_url_live: wss://api.elections.kalshi.com/trade-api/ws/v2
+  rate_limit_writes_per_second: 8   # below the 10/s basic tier limit
+  rate_limit_reads_per_second: 18   # below the 20/s basic tier limit
+
+risk:
+  # Position and exposure caps
+  max_position_per_market_usd: 25.0
+  max_total_exposure_usd: 200.0
+  max_daily_loss_usd: 50.0
+  # Hard per-order ceiling — never exceeded regardless of Kelly output
+  per_order_max_contracts: 50
+  # Runaway-loop guard — trips kill switch if exceeded
+  max_orders_per_minute: 10
+  # Minimum edge after fees, in basis points (200 = 2%)
+  min_edge_after_fees_bps: 200
+  # Fractional Kelly multiplier
+  kelly_fraction: 0.25
+  # Hard cap on size as fraction of bankroll, regardless of Kelly recommendation
+  max_kelly_size_pct_bankroll: 0.05
+  # API error spike threshold for automatic kill switch
+  error_spike_threshold: 5
+  error_spike_window_seconds: 60
+
+fees:
+  taker_rate: 0.07
+  maker_taker_ratio: 0.25  # maker fee is 25% of taker
+  assume_taker: true       # conservative: size as if all fills are taker
+
+markets:
+  whitelist_categories:
+    - economics
+    - kpi
+  # Optional explicit ticker allowlist (empty = allow all in whitelisted categories)
+  whitelist_tickers: []
+
+discord:
+  notify_on:
+    - trade
+    - error
+    - kill_switch
+    - eod_summary
+    - weekly_summary
+
+api:
+  host: 127.0.0.1
+  port: 8787
+
+kill_switch:
+  halt_file_path: /var/lib/kalshi-agent/HALT
+
+storage:
+  db_path: /var/lib/kalshi-agent/kalshi-agent.db
+
+journal:
+  log_dir: /var/log/kalshi-agent
+  retention_days: 90
+
+schedule:
+  # America/New_York; EOD lands after most Kalshi markets close
+  eod_summary_cron: "59 23 * * *"
+  weekly_summary_cron: "59 23 * * 0"
+  reconciliation_interval_seconds: 3600
+  strategy_tick_seconds: 60
+  risk_monitor_tick_seconds: 1
+  display_timezone: America/New_York
+
+strategy:
+  active: placeholder
+  placeholder:
+    # Demo market to ping once per hour for pipeline validation
+    test_ticker: INXD-26MAY16
+    emit_interval_seconds: 3600
