@@ -14,6 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from kalshi_agent.journal.logger import get_logger
 from kalshi_agent.kalshi.types import (
+    KalshiBalance,
+    KalshiFill,
     KalshiPosition,
     Market,
     OrderRequest,
@@ -186,6 +188,49 @@ class KalshiClient:
 
     async def cancel_order(self, order_id: str) -> None:
         await self._request("DELETE", f"/portfolio/orders/{order_id}")
+
+    async def cancel_all_resting(self) -> int:
+        """Cancel every open/resting order on the account. Returns number cancelled."""
+        resting = await self.list_orders(status="resting")
+        n = 0
+        for o in resting:
+            try:
+                await self.cancel_order(o.order_id)
+                n += 1
+            except KalshiAPIError as e:
+                log.warning("cancel_failed", order_id=o.order_id, error=str(e))
+        return n
+
+    async def get_order(self, order_id: str) -> OrderResponse:
+        data = await self._request("GET", f"/portfolio/orders/{order_id}")
+        return OrderResponse.model_validate(data.get("order", data))
+
+    async def get_balance(self) -> KalshiBalance:
+        data = await self._request("GET", "/portfolio/balance")
+        return KalshiBalance.model_validate(data)
+
+    async def list_fills(
+        self,
+        *,
+        ticker: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[KalshiFill], str | None]:
+        """List fills (executions) on the account. Returns (fills, next_cursor)."""
+        params: dict = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if cursor:
+            params["cursor"] = cursor
+        data = await self._request("GET", "/portfolio/fills", params=params)
+        fills = [KalshiFill.model_validate(f) for f in data.get("fills", [])]
+        return fills, data.get("cursor")
 
 
 def _api_path(path: str) -> str:

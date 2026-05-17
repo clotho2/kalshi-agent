@@ -70,11 +70,30 @@ schedule:
   reconciliation_interval_seconds: 3600
   strategy_tick_seconds: 60
   risk_monitor_tick_seconds: 1
+  fill_poll_interval_seconds: 5
+  bankroll_ttl_seconds: 10.0
+  ws_watchdog_timeout_seconds: 60.0
   display_timezone: America/New_York
 
 strategy:
+  # active: placeholder | llm_assessor
   active: placeholder
   placeholder:
     # Demo market to ping once per hour for pipeline validation
     test_ticker: INXD-26MAY16
     emit_interval_seconds: 3600
+  llm_assessor:
+    tickers: []                 # explicit allowlist of tickers to assess
+    min_edge: 0.04              # require >=4% edge before producing a signal
+    min_confidence: 0.6         # require >=0.6 LLM confidence
+    signal_ttl_minutes: 10
+    min_seconds_between_signals_per_ticker: 1800
+
+llm:
+  base_url: https://openrouter.ai/api/v1
+  # Any OpenRouter model id works (anthropic/claude-sonnet-4.6,
+  # openai/gpt-5, google/gemini-2.5-pro, meta-llama/llama-4-405b, etc.)
+  model: anthropic/claude-sonnet-4.6
+  temperature: 0.2
+  max_tokens: 1024
+  timeout_seconds: 60.0

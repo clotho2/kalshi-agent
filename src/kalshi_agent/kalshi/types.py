@@ -28,6 +28,9 @@ class Market(BaseModel):
     model_config = ConfigDict(extra="ignore")
     ticker: str
     event_ticker: str | None = None
+    title: str | None = None
+    subtitle: str | None = None
+    description: str | None = None
     category: str | None = None
     status: str | None = None
     yes_bid_dollars: str | None = None
@@ -71,3 +74,23 @@ class KalshiPosition(BaseModel):
     position: int  # signed: + = YES holdings, - = NO holdings
     market_exposure_dollars: str | None = None
     realized_pnl_dollars: str | None = None
+
+
+class KalshiFill(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    trade_id: str | None = None
+    order_id: str
+    ticker: str
+    side: Side
+    action: Action
+    count: int
+    yes_price_dollars: str | None = None
+    no_price_dollars: str | None = None
+    is_taker: bool = True
+    created_time: datetime | None = None
+
+
+class KalshiBalance(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    balance_dollars: str  # spendable cash, decimal string
+    payout_dollars: str | None = None  # value if all open YES positions resolve true

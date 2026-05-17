@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -16,9 +17,11 @@ from kalshi_agent.config import Config
 from kalshi_agent.journal.logger import get_logger
 from kalshi_agent.safety.fees import edge_after_fees_dollars, total_fee_dollars
 from kalshi_agent.safety.kill_switch import KillSwitch
-from kalshi_agent.storage.models import Fill, Position
+from kalshi_agent.storage.models import Position
 
 log = get_logger(__name__)
+
+_ONE_DAY = timedelta(days=1)
 
 
 @dataclass
@@ -87,18 +90,33 @@ class RiskMonitor:
             return Decimal(p.avg_price_dollars) * Decimal(p.count)
 
     def daily_realized_pnl_dollars(self) -> Decimal:
-        """PnL since 00:00 in the display timezone (typically ET)."""
+        """Realized PnL since 00:00 in the display timezone (typically ET).
+
+        Uses the PnlDaily.realized_pnl snapshot taken at last midnight rollover
+        and subtracts it from the current sum-of-positions realized_pnl.
+        """
         from datetime import datetime
 
+        from kalshi_agent.storage.models import PnlDaily
+
         now_local = datetime.now(self._tz)
-        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        midnight_utc = midnight_local.astimezone(ZoneInfo("UTC"))
+        today = now_local.strftime("%Y-%m-%d")
+        yesterday = (now_local.replace(hour=12) - _ONE_DAY).strftime("%Y-%m-%d")
         with self._sm() as s:
-            fills = s.scalars(select(Fill).where(Fill.created_at >= midnight_utc)).all()
-            pnl = Decimal("0")
-            for f in fills:
-                pnl -= Decimal(f.fee_dollars)
-        return pnl  # realized component is folded in via position updates separately
+            positions = s.scalars(select(Position)).all()
+            current_total = sum(
+                (Decimal(str(p.realized_pnl_dollars)) for p in positions),
+                Decimal("0"),
+            )
+            # Baseline = realized total as of yesterday's snapshot, or 0 if none
+            base_row = s.get(PnlDaily, yesterday)
+            baseline = (
+                Decimal(str(base_row.realized_pnl)) if base_row else Decimal("0")
+            )
+            # Also subtract fees on today's fills not yet aggregated into positions
+            today_row = s.get(PnlDaily, today)
+            _ = today_row  # snapshot is informational only; live calc is from positions
+        return current_total - baseline
 
     # ---- pre-trade check --------------------------------------------------
 

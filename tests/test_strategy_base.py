@@ -15,6 +15,11 @@ from kalshi_agent.strategies.base import Signal
 from kalshi_agent.strategies.placeholder import PlaceholderStrategy
 
 
+class _FakeBankroll:
+    async def get(self) -> Decimal:
+        return Decimal("1000")
+
+
 def _future() -> datetime:
     return datetime.now(UTC) + timedelta(minutes=5)
 
@@ -71,7 +76,7 @@ async def test_execution_end_to_end_paper(config, kill_switch, db_session_maker)
     reconciler = Reconciler(mock_client, db_session_maker, discord=None)
     executor = Executor(
         config, mock_client, risk, reconciler, db_session_maker,
-        discord=None, bankroll_provider=lambda: Decimal("1000"),
+        discord=None, bankroll=_FakeBankroll(),
     )
 
     sig = Signal(
@@ -110,7 +115,7 @@ async def test_execution_rejects_when_killed(config, kill_switch, db_session_mak
     reconciler = Reconciler(mock_client, db_session_maker, discord=None)
     executor = Executor(
         config, mock_client, risk, reconciler, db_session_maker,
-        discord=None, bankroll_provider=lambda: Decimal("1000"),
+        discord=None, bankroll=_FakeBankroll(),
     )
 
     sig = Signal(

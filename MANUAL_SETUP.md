@@ -148,6 +148,75 @@ piped to your existing backup mechanism. The JSONL logs are append-only and
 self-rotate; rsync `/var/log/kalshi-agent/` to a remote host if you want
 extra durability.
 
+## 10b. Verify Kalshi auth
+
+Before letting the service run unattended, sanity-check the signing logic:
+
+```bash
+sudo -u kalshi bash -c '
+  set -a
+  source /etc/kalshi-agent/env
+  set +a
+  cd /opt/kalshi-agent
+  ./scripts/verify_auth.sh
+'
+# Expected output:  OK balance=0.0000  (or your actual demo balance)
+```
+
+If this fails with `401`, regenerate the API key on Kalshi (Settings → API Keys),
+re-upload the public key, and double-check `KALSHI_API_KEY_ID` matches the Key ID
+the UI shows.
+
+## 10c. SQLite backups
+
+```bash
+sudo crontab -u kalshi -e
+# Add:
+0 3 * * * /opt/kalshi-agent/scripts/backup.sh >> /var/log/kalshi-agent/backup.log 2>&1
+```
+
+Backups go to `/var/lib/kalshi-agent/backups/`, gzipped, 30-day retention.
+
+## 10d. Liveness alerting (optional but recommended)
+
+Create a check at https://healthchecks.io (free tier) or your alerting system,
+copy the ping URL, and set it in `/etc/kalshi-agent/env`:
+
+```ini
+LIVENESS_HEARTBEAT_URL=https://hc-ping.com/your-uuid
+```
+
+The agent pings every 60s while alive. healthchecks.io alerts you if pings stop.
+
+## 10e. Enabling the LLM strategy
+
+Default strategy is `placeholder`. To switch to the LLM-driven assessor:
+
+1. Add your OpenRouter API key to `/etc/kalshi-agent/env`:
+   ```ini
+   OPENROUTER_API_KEY=sk-or-v1-...
+   ```
+2. Edit `/etc/kalshi-agent/config.yaml`:
+   ```yaml
+   strategy:
+     active: llm_assessor
+     llm_assessor:
+       tickers:
+         - KXCPI-26MAY      # actual Kalshi tickers you want assessed
+         - KXJOBS-26JUN
+       min_edge: 0.04           # require 4%+ edge before signal
+       min_confidence: 0.6      # require 0.6+ LLM confidence
+       signal_ttl_minutes: 10
+       min_seconds_between_signals_per_ticker: 1800
+
+   llm:
+     model: anthropic/claude-sonnet-4.6   # any OpenRouter model id
+     temperature: 0.2
+   ```
+3. `sudo systemctl restart kalshi-agent` and watch the dashboard. Most LLM
+   assessments will not meet the edge/confidence filter — that's expected and
+   intentional. The strategy is conservative by design.
+
 ## 11. Switching to live mode
 
 **Do not flip to live until you've watched the service in paper mode for at

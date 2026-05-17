@@ -81,7 +81,7 @@ cp config/config.example.yaml config/config.yaml
 .venv/bin/pytest -v
 ```
 
-36 tests should pass: risk monitor, kill switch, reconciliation, kalshi client (auth + retries + rate limits), strategy base + execution.
+69 tests should pass: risk monitor, kill switch, reconciliation, Kalshi client (auth + retries + rate limits + decimal pricing), positions/PnL math, fill ingestion + idempotency, startup recovery, halt actions (cancel-on-engage), anti-self-trade, bankroll caching, OpenRouter client, LLM strategy filters, plus the original strategy base + execution flow.
 
 ## Run in paper mode
 
@@ -186,12 +186,28 @@ provisioning.
 | Bearer token for control + remote observer | Brief's auth model; localhost observer is no-auth to keep curl-debug easy. |
 | Independent of any LLM/orchestrator process | This service is the trade-authority root; LLM signals come in via Strategy implementations only. |
 
-## What's stubbed in this skeleton
+## What runs today
 
-* `bankroll_provider` in `__main__.py` returns a fixed `$1000`. Real wiring fetches `/portfolio/balance` from Kalshi on each tick.
-* WebSocket price feed (`KalshiClient` has REST only; WS reconnect logic + watchdog is queued for next pass).
-* Fill ingestion: `Fill` rows are written by future WS handler / reconciliation; right now the executor only writes `Order` rows.
-* Real strategies — see `strategies/placeholder.py` for the only concrete `Strategy`.
+* **Real bankroll** — `Bankroll` polls `GET /portfolio/balance`, caches for 10s, falls back to last good value on transient failure.
+* **Fill ingestion** — polls `GET /portfolio/fills` every 5s, applies to `Position`/`Fill` tables with full duplicate-detection. Fees computed via the Kalshi parabolic formula.
+* **Realized PnL** — accumulated on every fill via paired-position math (buy YES + buy NO = $1 lock-in). Daily snapshots at 00:00 ET feed the equity-curve chart.
+* **Anti-self-trade** — refuses to open new exposure on the opposite side of an existing position; the rational close is to buy the opposite, which is allowed and realizes PnL via pairing.
+* **Cancel-on-HALT** — when the kill switch engages (any path), `HaltMonitor` calls `cancel_all_resting` and marks every local pending/resting order `cancelled_by_halt`.
+* **Startup recovery** — on every restart, any local order with `status='pending'` is matched against Kalshi's order list by `client_order_id`. Matched orders adopt the server's true status; orphans are flagged `lost` and posted to Discord.
+* **Reconciliation** — startup + hourly, Kalshi positions are source of truth. Fill catch-up runs after every reconcile so downtime fills get backfilled.
+* **WebSocket client** (`kalshi/ws.py`) — RSA-signed handshake, exponential-backoff reconnect, message watchdog that trips the kill switch on silence. Coded; strategies can subscribe to live price feeds via `KalshiWebSocket.on(channel, handler)`.
+* **OpenRouter LLM** — `OpenRouterClient` posts to `chat/completions` with JSON-mode, retries 429/5xx, parses content. Any OpenRouter model id works (`anthropic/claude-sonnet-4.6`, `openai/gpt-5`, `google/gemini-2.5-pro`, etc.).
+* **LLM market assessor strategy** — for each whitelisted ticker, fetches the market, asks the LLM to estimate `P(YES)` given title/description/prices, emits a signal if `(LLM probability ± market price) > min_edge` and `LLM confidence > min_confidence`. The downstream risk monitor still re-checks edge after fees.
+* **Placeholder strategy** — kept for paper-mode pipeline testing (one signal/hour, low-confidence so risk monitor rejects).
+* **Equity curve dashboard** — Chart.js line chart of daily realized PnL with 30-day window; KPI strip shows realized total, today's PnL, open positions, open exposure.
+* **EOD/weekly summaries** — full content: orders, fills, fees, realized PnL, list of open positions.
+* **Liveness heartbeat** — outbound GET to `LIVENESS_HEARTBEAT_URL` every 60s; alerting is whatever endpoint you point it at (healthchecks.io, UptimeRobot, etc.).
+* **SQLite backup** — `scripts/backup.sh` writes a gzipped `.backup` to `BACKUP_DIR`, retains 30 days. Wire into cron.
+
+## What's intentionally not done
+
+* **Auth verification against the real Kalshi demo** — couldn't be smoke-tested from the build sandbox (egress blocked). Run `scripts/verify_auth.sh` on the Hetzner box with real credentials before flipping to live.
+* **WebSocket-driven price feed in `__main__.py`** — the client is coded and tested at module level, but the LLM strategy makes one REST call per signal so live price streaming wasn't required. To enable it, add a `KalshiWebSocket` instance in `__main__.amain` and subscribe to `ticker` channels for your whitelist.
 
 ## Repo layout
 

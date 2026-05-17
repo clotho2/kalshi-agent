@@ -10,16 +10,23 @@ from pathlib import Path
 
 import uvicorn
 
+from kalshi_agent.bankroll import Bankroll
 from kalshi_agent.config import load_config
 from kalshi_agent.execution import Executor
+from kalshi_agent.fills import FillIngestor
 from kalshi_agent.journal.discord import DiscordNotifier
 from kalshi_agent.journal.logger import configure_logging, get_logger
 from kalshi_agent.kalshi.client import KalshiClient
+from kalshi_agent.liveness import LivenessHeartbeat
+from kalshi_agent.llm.openrouter import OpenRouterClient
+from kalshi_agent.recovery import recover_in_flight_orders
+from kalshi_agent.safety.halt_actions import HaltMonitor
 from kalshi_agent.safety.kill_switch import KillSwitch
 from kalshi_agent.safety.reconciliation import Reconciler
 from kalshi_agent.safety.risk_monitor import RiskMonitor
 from kalshi_agent.scheduler import build_scheduler
 from kalshi_agent.storage.db import healthcheck, init_db, make_engine, session_factory
+from kalshi_agent.strategies.llm_market_assessor import LLMMarketAssessor
 from kalshi_agent.strategies.placeholder import PlaceholderStrategy
 
 
@@ -36,7 +43,8 @@ async def amain(args: argparse.Namespace) -> int:
     configure_logging(config.journal.log_dir, config.journal.retention_days)
     log = get_logger("kalshi_agent.main")
 
-    log.info("startup", mode=config.mode, base_url=config.kalshi_base_url)
+    log.info("startup", mode=config.mode, base_url=config.kalshi_base_url,
+             strategy=config.strategy.active)
 
     engine = make_engine(config.storage.db_path)
     init_db(engine)
@@ -59,31 +67,93 @@ async def amain(args: argparse.Namespace) -> int:
 
     reconciler = Reconciler(client, sm, discord)
     risk = RiskMonitor(config, kill, sm)
+    bankroll = Bankroll(client, ttl_seconds=config.schedule.bankroll_ttl_seconds,
+                        fallback_dollars=Decimal("0"))
+    halt_monitor = HaltMonitor(kill, client, sm, discord)
+    fill_ingestor = FillIngestor(config, client, sm, discord)
 
-    # bankroll provider — for now, a static placeholder; live wiring fetches /portfolio/balance
-    def bankroll() -> Decimal:
-        return Decimal("1000")  # paper mode starting bankroll
+    # Strategy selection
+    llm_client_cm: OpenRouterClient | None = None
+    llm_client: OpenRouterClient | None = None
+    if config.strategy.active == "llm_assessor":
+        if not config.secrets.openrouter_api_key:
+            log.error("openrouter_api_key_missing")
+            await client_cm.__aexit__(None, None, None)
+            return 2
+        if not config.strategy.llm_assessor or not config.strategy.llm_assessor.tickers:
+            log.error("llm_assessor_tickers_empty")
+            await client_cm.__aexit__(None, None, None)
+            return 2
+        llm_client_cm = OpenRouterClient(
+            api_key=config.secrets.openrouter_api_key.get_secret_value(),
+            model=config.llm.model,
+            base_url=config.llm.base_url,
+            timeout=config.llm.timeout_seconds,
+        )
+        llm_client = await llm_client_cm.__aenter__()
+        strategy = LLMMarketAssessor(
+            kalshi_client=client,
+            llm_client=llm_client,
+            session_maker=sm,
+            tickers=config.strategy.llm_assessor.tickers,
+            min_edge=Decimal(str(config.strategy.llm_assessor.min_edge)),
+            min_confidence=Decimal(str(config.strategy.llm_assessor.min_confidence)),
+            signal_ttl_minutes=config.strategy.llm_assessor.signal_ttl_minutes,
+            min_seconds_between_signals_per_ticker=(
+                config.strategy.llm_assessor.min_seconds_between_signals_per_ticker
+            ),
+        )
+    else:
+        strategy = PlaceholderStrategy(
+            config.strategy.placeholder.test_ticker,
+            config.strategy.placeholder.emit_interval_seconds,
+        )
 
     executor = Executor(config, client, risk, reconciler, sm, discord, bankroll)
-    strategy = PlaceholderStrategy(
-        config.strategy.placeholder.test_ticker,
-        config.strategy.placeholder.emit_interval_seconds,
-    )
 
-    sched = build_scheduler(config, strategy, executor, reconciler, sm, discord)
+    sched = build_scheduler(config, strategy, executor, reconciler, fill_ingestor, sm, discord)
     sched.start()
 
     stop_event = asyncio.Event()
     risk_task = asyncio.create_task(risk.run_background(stop_event))
+    halt_task = asyncio.create_task(halt_monitor.run(stop_event))
+    fill_task = asyncio.create_task(
+        fill_ingestor.poll_loop(stop_event, config.schedule.fill_poll_interval_seconds)
+    )
 
-    # Startup reconciliation (best-effort — don't block startup on failure)
-    asyncio.create_task(reconciler.reconcile(source="startup"))
+    liveness = LivenessHeartbeat(
+        config.secrets.liveness_heartbeat_url.get_secret_value()
+        if config.secrets.liveness_heartbeat_url else None
+    )
+    liveness_task = asyncio.create_task(liveness.run(stop_event))
 
-    # Build FastAPI app & uvicorn server in same loop
+    # Startup: recover in-flight orders, then refresh bankroll, then reconcile, then catch up fills
+    async def _startup_sequence() -> None:
+        try:
+            await recover_in_flight_orders(client, sm, discord)
+        except Exception as e:
+            log.error("startup_recovery_failed", error=str(e))
+        try:
+            await bankroll.refresh()
+        except Exception as e:
+            log.error("startup_bankroll_failed", error=str(e))
+        try:
+            await reconciler.reconcile(source="startup")
+        except Exception as e:
+            log.error("startup_reconcile_failed", error=str(e))
+        try:
+            await fill_ingestor.catch_up()
+        except Exception as e:
+            log.error("startup_fill_catchup_failed", error=str(e))
+
+    startup_task = asyncio.create_task(_startup_sequence())
+
     from kalshi_agent.api.server import create_app
 
     async def trigger_reconcile() -> dict:
-        return await reconciler.reconcile(source="manual_http")
+        result = await reconciler.reconcile(source="manual_http")
+        await fill_ingestor.catch_up()
+        return result
 
     app = create_app(config, sm, kill, trigger_reconcile, lambda: healthcheck(engine))
     uconfig = uvicorn.Config(app, host=config.api.host, port=config.api.port,
@@ -97,14 +167,20 @@ async def amain(args: argparse.Namespace) -> int:
     server_task = asyncio.create_task(server.serve())
     log.info("server_started", host=config.api.host, port=config.api.port)
     if discord.enabled:
-        await discord.post(f":rocket: kalshi-agent started in **{config.mode}** mode")
+        await discord.post(
+            f":rocket: kalshi-agent started in **{config.mode}** mode "
+            f"(strategy: {config.strategy.active})"
+        )
 
     await stop_event.wait()
     log.info("shutdown_signal_received")
     server.should_exit = True
     sched.shutdown(wait=False)
-    risk_task.cancel()
+    for t in (risk_task, halt_task, fill_task, liveness_task, startup_task):
+        t.cancel()
     await asyncio.gather(server_task, return_exceptions=True)
+    if llm_client_cm:
+        await llm_client_cm.__aexit__(None, None, None)
     await client_cm.__aexit__(None, None, None)
     log.info("shutdown_complete")
     return 0

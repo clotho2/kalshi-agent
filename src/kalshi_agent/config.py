@@ -77,9 +77,26 @@ class PlaceholderStrategyConfig(BaseModel):
     emit_interval_seconds: int = 3600
 
 
+class LLMAssessorStrategyConfig(BaseModel):
+    tickers: list[str] = Field(default_factory=list)
+    min_edge: float = 0.04
+    min_confidence: float = 0.6
+    signal_ttl_minutes: int = 10
+    min_seconds_between_signals_per_ticker: int = 1800
+
+
 class StrategyConfig(BaseModel):
-    active: str = "placeholder"
+    active: Literal["placeholder", "llm_assessor"] = "placeholder"
     placeholder: PlaceholderStrategyConfig
+    llm_assessor: LLMAssessorStrategyConfig | None = None
+
+
+class LLMConfig(BaseModel):
+    base_url: str = "https://openrouter.ai/api/v1"
+    model: str = "anthropic/claude-sonnet-4.6"
+    temperature: float = 0.2
+    max_tokens: int = 1024
+    timeout_seconds: float = 60.0
 
 
 class ScheduleConfig(BaseModel):
@@ -88,6 +105,9 @@ class ScheduleConfig(BaseModel):
     reconciliation_interval_seconds: int = 3600
     strategy_tick_seconds: int = 60
     risk_monitor_tick_seconds: int = 1
+    fill_poll_interval_seconds: int = 5
+    bankroll_ttl_seconds: float = 10.0
+    ws_watchdog_timeout_seconds: float = 60.0
     display_timezone: str = "America/New_York"
 
 
@@ -105,6 +125,8 @@ class Secrets(BaseSettings):
     kalshi_private_key_path: Path
     discord_webhook_url: SecretStr | None = None
     control_bearer_token: SecretStr
+    openrouter_api_key: SecretStr | None = None
+    liveness_heartbeat_url: SecretStr | None = None
 
 
 class Config(BaseModel):
@@ -120,6 +142,7 @@ class Config(BaseModel):
     journal: JournalConfig
     schedule: ScheduleConfig
     strategy: StrategyConfig
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     secrets: Secrets
 
     @property

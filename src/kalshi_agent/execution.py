@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import sessionmaker
 
+from kalshi_agent.bankroll import Bankroll
 from kalshi_agent.config import Config
 from kalshi_agent.journal.discord import DiscordNotifier
 from kalshi_agent.journal.logger import get_logger
@@ -15,7 +16,7 @@ from kalshi_agent.kalshi.client import KalshiAPIError, KalshiAuthError, KalshiCl
 from kalshi_agent.kalshi.types import OrderRequest, price_decimal_to_str, price_str_to_decimal
 from kalshi_agent.safety.reconciliation import Reconciler
 from kalshi_agent.safety.risk_monitor import RiskMonitor
-from kalshi_agent.storage.models import Decision, Order
+from kalshi_agent.storage.models import Decision, Order, Position
 from kalshi_agent.strategies.base import Signal
 
 log = get_logger(__name__)
@@ -30,7 +31,7 @@ class Executor:
         reconciler: Reconciler,
         session_maker: sessionmaker,
         discord: DiscordNotifier | None,
-        bankroll_provider,  # callable returning current bankroll Decimal
+        bankroll: Bankroll,
     ) -> None:
         self._cfg = config
         self._client = client
@@ -38,10 +39,9 @@ class Executor:
         self._reconciler = reconciler
         self._sm = session_maker
         self._discord = discord
-        self._bankroll = bankroll_provider
+        self._bankroll = bankroll
 
     async def handle_signal(self, signal: Signal) -> None:
-        # Don't race reconciliation
         async with self._reconciler.lock:
             await self._handle_signal_inner(signal)
 
@@ -58,7 +58,26 @@ class Executor:
             self._persist_decision(signal, accepted=False, reason=f"market_fetch_failed:{e}")
             return
 
-        # Current price for the side we want to buy
+        # Market-status active check
+        if (market.status or "").lower() not in {"active", "open"}:
+            self._persist_decision(
+                signal, accepted=False,
+                reason=f"market_not_active:{market.status}",
+            )
+            return
+
+        # Anti-self-trade: if we already hold the opposite side, refuse to add more —
+        # the rational close is to buy the opposite, which the risk monitor will allow,
+        # but we don't open NEW exposure that would just lock in spread + fees.
+        with self._sm() as s:
+            existing = s.get(Position, signal.market_ticker)
+        if existing is not None and existing.count > 0 and existing.side != signal.side:
+            self._persist_decision(
+                signal, accepted=False,
+                reason=f"anti_self_trade:hold_{existing.side}_{existing.count}",
+            )
+            return
+
         if signal.side == "yes":
             ask = market.yes_ask_dollars
         else:
@@ -68,7 +87,11 @@ class Executor:
             return
         current_price = price_str_to_decimal(ask)
 
-        bankroll = self._bankroll()
+        bankroll = await self._bankroll.get()
+        if bankroll <= 0:
+            self._persist_decision(signal, accepted=False, reason="zero_bankroll")
+            return
+
         decision = self._risk.check_trade(
             market_ticker=signal.market_ticker,
             side=signal.side,
@@ -84,12 +107,16 @@ class Executor:
             log.info("trade_rejected", ticker=signal.market_ticker, reason=decision.reason)
             return
 
+        # Final pre-flight: signal could have aged out while we did network IO
+        if signal.is_expired():
+            self._persist_decision(signal, accepted=False, reason="signal_expired_preflight")
+            return
+
         client_order_id = str(uuid.uuid4())
         decision_row_id = self._persist_decision(
             signal, accepted=True, reason=None, order_id=client_order_id,
         )
 
-        # Persist Order row BEFORE sending so we can recover on restart
         with self._sm() as s:
             order_row = Order(
                 client_order_id=client_order_id,
@@ -106,7 +133,6 @@ class Executor:
 
         self._risk.record_order_attempt()
 
-        # Build & send
         req = OrderRequest(
             ticker=signal.market_ticker,
             side=signal.side,
@@ -144,13 +170,16 @@ class Executor:
             ticker=signal.market_ticker, side=signal.side,
             contracts=decision.sized_contracts, price=price_decimal_to_str(current_price),
             order_id=resp.order_id, client_order_id=client_order_id,
+            expected_edge_dollars=str(decision.expected_edge_dollars),
+            expected_fees_dollars=str(decision.expected_fees_dollars),
         )
 
         if self._discord:
             await self._discord.post(
                 f":chart_with_upwards_trend: **{signal.market_ticker}** {signal.side.upper()} "
                 f"{decision.sized_contracts} @ {price_decimal_to_str(current_price)} | "
-                f"p={signal.model_probability:.3f} | {signal.rationale[:120]}"
+                f"p={signal.model_probability:.3f} edge=${decision.expected_edge_dollars:.4f} | "
+                f"{signal.rationale[:120]}"
             )
 
     def _persist_decision(

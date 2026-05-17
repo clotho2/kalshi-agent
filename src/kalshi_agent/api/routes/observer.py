@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from kalshi_agent.storage.models import Decision, Fill, Order, Position
+from kalshi_agent.storage.models import Decision, Fill, Order, PnlDaily, Position
 
 
 def make_router(session_maker: sessionmaker, observer_auth) -> APIRouter:
@@ -75,6 +75,19 @@ def make_router(session_maker: sessionmaker, observer_auth) -> APIRouter:
             realized = sum(p.realized_pnl_dollars for p in positions)
         return {"period": period, "fees_dollars": fees, "trade_count": trade_count,
                 "realized_pnl_dollars": realized}
+
+    @router.get("/equity_curve")
+    async def equity_curve(days: int = Query(30, le=365)) -> dict:
+        cutoff_date = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+        with session_maker() as s:
+            rows = s.scalars(
+                select(PnlDaily).where(PnlDaily.day >= cutoff_date)
+                .order_by(PnlDaily.day.asc())
+            ).all()
+        labels = [r.day for r in rows]
+        realized = [r.realized_pnl for r in rows]
+        fees = [r.fees for r in rows]
+        return {"days": labels, "realized_pnl": realized, "fees": fees}
 
     @router.get("/market/{ticker}")
     async def market(ticker: str) -> dict:

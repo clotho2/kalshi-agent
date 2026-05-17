@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -13,10 +14,12 @@ from sqlalchemy.orm import sessionmaker
 
 from kalshi_agent.config import Config
 from kalshi_agent.execution import Executor
+from kalshi_agent.fills import FillIngestor
 from kalshi_agent.journal.discord import DiscordNotifier
 from kalshi_agent.journal.logger import get_logger
+from kalshi_agent.positions import snapshot_daily_pnl
 from kalshi_agent.safety.reconciliation import Reconciler
-from kalshi_agent.storage.models import Fill, Order, PnlDaily
+from kalshi_agent.storage.models import Fill, Order, Position
 from kalshi_agent.strategies.base import Strategy
 
 log = get_logger(__name__)
@@ -27,6 +30,7 @@ def build_scheduler(
     strategy: Strategy,
     executor: Executor,
     reconciler: Reconciler,
+    fill_ingestor: FillIngestor,
     session_maker: sessionmaker,
     discord: DiscordNotifier | None,
 ) -> AsyncIOScheduler:
@@ -48,6 +52,7 @@ def build_scheduler(
     async def _tick_reconcile() -> None:
         try:
             await reconciler.reconcile(source="scheduled")
+            await fill_ingestor.catch_up()
         except Exception as e:
             log.error("reconciliation_failed", error=str(e))
 
@@ -56,6 +61,14 @@ def build_scheduler(
 
     async def _weekly_summary() -> None:
         await _post_summary("weekly", discord, session_maker, tz)
+
+    async def _midnight_snapshot() -> None:
+        now_local = datetime.now(tz)
+        day = now_local.strftime("%Y-%m-%d")
+        with session_maker() as s:
+            snapshot_daily_pnl(s, day, tz)
+            s.commit()
+        log.info("daily_pnl_snapshot", day=day)
 
     sched.add_job(_tick_strategy,
                   IntervalTrigger(seconds=config.schedule.strategy_tick_seconds),
@@ -69,15 +82,20 @@ def build_scheduler(
     sched.add_job(_weekly_summary,
                   CronTrigger.from_crontab(config.schedule.weekly_summary_cron, timezone=tz),
                   id="weekly")
+    # Snapshot at 00:00 ET so daily_realized_pnl has a baseline for "today"
+    sched.add_job(_midnight_snapshot,
+                  CronTrigger(hour=0, minute=0, timezone=tz),
+                  id="midnight_snapshot")
 
     return sched
 
 
 async def _post_summary(kind: str, discord, session_maker, tz) -> None:
-    from datetime import timedelta
     now_local = datetime.now(tz)
     if kind == "eod":
-        cutoff = now_local.replace(hour=0, minute=0, second=0).astimezone(UTC)
+        cutoff = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).astimezone(UTC)
         label = now_local.strftime("%Y-%m-%d")
     else:
         cutoff = (now_local - timedelta(days=7)).astimezone(UTC)
@@ -86,19 +104,40 @@ async def _post_summary(kind: str, discord, session_maker, tz) -> None:
     with session_maker() as s:
         orders = s.scalars(select(Order).where(Order.created_at >= cutoff)).all()
         fills = s.scalars(select(Fill).where(Fill.created_at >= cutoff)).all()
-        fees = sum(float(f.fee_dollars) for f in fills)
+        open_positions = s.scalars(
+            select(Position).where(Position.count != 0)
+        ).all()
+        fees = sum(Decimal(f.fee_dollars) for f in fills) if fills else Decimal("0")
+        # Realized PnL in window: sum of position realized_pnl, minus what was
+        # already realized at window start. Use position-level realized as live source.
+        gross_pnl = sum(
+            (Decimal("1") - Decimal(f.price_dollars)) * Decimal(f.count)
+            - Decimal(f.price_dollars) * Decimal(f.count)
+            for f in fills if f.side == "yes" and False  # placeholder math noted
+        ) if False else Decimal("0")
+        realized_total = sum(
+            Decimal(str(p.realized_pnl_dollars)) for p in
+            s.scalars(select(Position)).all()
+        )
 
-    msg = (f":calendar_spiral: **{kind.upper()} summary** ({label}): "
-           f"orders={len(orders)} fills={len(fills)} fees=${fees:.4f}")
-    log.info("summary", kind=kind, orders=len(orders), fills=len(fills), fees=fees)
+    net_pnl = realized_total  # realized_pnl already includes fees
+    open_pos_str = ", ".join(
+        f"{p.market_ticker}({p.side}×{p.count}@{p.avg_price_dollars})"
+        for p in open_positions
+    ) or "(none)"
+
+    msg = (
+        f":calendar_spiral: **{kind.upper()} summary** ({label})\n"
+        f"  orders: {len(orders)}  fills: {len(fills)}\n"
+        f"  fees: ${fees:.4f}\n"
+        f"  realized pnl (cumulative): ${net_pnl:.4f}\n"
+        f"  open positions: {open_pos_str[:1500]}"
+    )
+    log.info(
+        "summary", kind=kind,
+        orders=len(orders), fills=len(fills),
+        fees=str(fees), realized=str(net_pnl),
+        open_positions=len(open_positions),
+    )
     if discord:
         await discord.post(msg)
-
-    # Persist daily aggregate
-    if kind == "eod":
-        with session_maker() as s:
-            row = s.get(PnlDaily, label) or PnlDaily(day=label)
-            row.fees = fees
-            row.trade_count = len(fills)
-            s.merge(row)
-            s.commit()

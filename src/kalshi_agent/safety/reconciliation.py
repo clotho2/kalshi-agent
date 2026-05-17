@@ -52,15 +52,21 @@ class Reconciler:
             # Update or insert from remote
             for ticker, rpos in remote_by_ticker.items():
                 lpos = local.get(ticker)
-                # Map signed Kalshi position to (side, count)
                 if rpos.position == 0:
                     side, count = "yes", 0
                 else:
                     side = "yes" if rpos.position > 0 else "no"
                     count = abs(rpos.position)
+                realized = (
+                    float(rpos.realized_pnl_dollars)
+                    if rpos.realized_pnl_dollars else 0.0
+                )
                 if lpos is None:
-                    s.add(Position(market_ticker=ticker, side=side, count=count,
-                                   avg_price_dollars="0.0000"))
+                    s.add(Position(
+                        market_ticker=ticker, side=side, count=count,
+                        avg_price_dollars="0.0000",
+                        realized_pnl_dollars=realized,
+                    ))
                     discrepancies.append({"ticker": ticker, "kind": "missing_local", "remote": count})
                 elif lpos.count != count or lpos.side != side:
                     discrepancies.append({
@@ -70,6 +76,9 @@ class Reconciler:
                     })
                     lpos.side = side
                     lpos.count = count
+                    # Adopt server's realized_pnl as authoritative on mismatch
+                    if rpos.realized_pnl_dollars:
+                        lpos.realized_pnl_dollars = realized
 
             # Local positions absent from remote = closed externally
             for ticker, lpos in local.items():
