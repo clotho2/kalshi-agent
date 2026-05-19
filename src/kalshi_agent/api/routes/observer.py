@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from kalshi_agent.safety.pnl import cumulative_realized_pnl, realized_pnl_since
 from kalshi_agent.storage.models import Decision, Fill, Order, PnlDaily, Position
 
 
-def make_router(session_maker: sessionmaker, observer_auth) -> APIRouter:
+def make_router(session_maker: sessionmaker, observer_auth, display_tz: str = "America/New_York") -> APIRouter:
     router = APIRouter(prefix="/api/observer", dependencies=[Depends(observer_auth)])
+    tz = ZoneInfo(display_tz)
 
     @router.get("/positions")
     async def positions() -> list[dict]:
@@ -61,20 +65,30 @@ def make_router(session_maker: sessionmaker, observer_auth) -> APIRouter:
     @router.get("/pnl")
     async def pnl(period: str = Query("today", pattern="^(today|week|month|all)$")) -> dict:
         now = datetime.now(UTC)
-        cutoff = {
-            "today": now - timedelta(days=1),
-            "week": now - timedelta(days=7),
-            "month": now - timedelta(days=30),
-            "all": datetime(1970, 1, 1, tzinfo=UTC),
-        }[period]
+        if period == "today":
+            now_local = now.astimezone(tz)
+            cutoff = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+        else:
+            cutoff = {
+                "week": now - timedelta(days=7),
+                "month": now - timedelta(days=30),
+                "all": datetime(1970, 1, 1, tzinfo=UTC),
+            }[period]
         with session_maker() as s:
             fills = s.scalars(select(Fill).where(Fill.created_at >= cutoff)).all()
-            fees = sum(float(f.fee_dollars) for f in fills)
+            fees = sum((Decimal(f.fee_dollars) for f in fills), Decimal("0"))
             trade_count = len(fills)
-            positions = s.scalars(select(Position)).all()
-            realized = sum(p.realized_pnl_dollars for p in positions)
-        return {"period": period, "fees_dollars": fees, "trade_count": trade_count,
-                "realized_pnl_dollars": realized}
+            if period == "all":
+                realized = cumulative_realized_pnl(s)
+            else:
+                realized = realized_pnl_since(s, cutoff, tz)
+        return {
+            "period": period,
+            "cutoff_utc": cutoff.isoformat(),
+            "fees_dollars": float(fees),
+            "trade_count": trade_count,
+            "realized_pnl_dollars": float(realized),
+        }
 
     @router.get("/equity_curve")
     async def equity_curve(days: int = Query(30, le=365)) -> dict:
