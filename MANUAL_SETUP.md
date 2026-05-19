@@ -11,6 +11,10 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin kalshi
 
 sudo mkdir -p /opt/kalshi-agent /etc/kalshi-agent /var/lib/kalshi-agent /var/log/kalshi-agent
 sudo chown -R kalshi:kalshi /var/lib/kalshi-agent /var/log/kalshi-agent
+# Critical: the `kalshi` user must be able to traverse /etc/kalshi-agent to reach
+# the config and env files. Owning the dir as root:kalshi (group-traversable) is
+# the minimum permissive setup — files inside stay readable only by root and kalshi.
+sudo chown root:kalshi /etc/kalshi-agent
 sudo chmod 750 /etc/kalshi-agent
 ```
 
