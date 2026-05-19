@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from kalshi_agent.strategies.base import Signal, Strategy
+
+UTC = timezone.utc
 
 
 class PlaceholderStrategy(Strategy):
@@ -27,7 +29,7 @@ class PlaceholderStrategy(Strategy):
                 market_ticker=self._ticker,
                 side="yes",
                 model_probability=0.55,
-                confidence=0.1,  # intentionally low — keeps sizing tiny
+                confidence=0.1,
                 rationale="placeholder signal for pipeline validation",
                 valid_until=datetime.now(UTC) + timedelta(minutes=5),
                 strategy_name=self.name,
