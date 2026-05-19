@@ -96,7 +96,8 @@ class LLMAssessorStrategyConfig(BaseModel):
 
 class StrategyConfig(BaseModel):
     active: Literal["placeholder", "llm_assessor"] = "placeholder"
-    placeholder: PlaceholderStrategyConfig
+    # Both sub-configs are optional; the active strategy must have its block present.
+    placeholder: PlaceholderStrategyConfig | None = None
     llm_assessor: LLMAssessorStrategyConfig | None = None
 
 
