@@ -79,6 +79,9 @@ strategy:
   # active: placeholder | llm_assessor
   # The block matching `active` MUST be present; the other can be omitted.
   active: llm_assessor
+  # Placeholder is allowed in paper mode only by default. Live mode refuses to
+  # start with placeholder unless allow_placeholder_live is deliberately set true.
+  allow_placeholder_live: false
 
   llm_assessor:
     # Manual mode: list specific tickers here, only those are assessed.

@@ -31,7 +31,11 @@ def create_app(
         kill_switch_fn=kill_switch.is_engaged,
         db_health_fn=db_health_fn,
     ))
-    app.include_router(observer.make_router(session_maker, observer_auth))
+    app.include_router(observer.make_router(
+        session_maker,
+        observer_auth,
+        display_tz=config.schedule.display_timezone,
+    ))
     app.include_router(control.make_router(kill_switch, control_auth, trigger_reconcile))
     app.include_router(dashboard.make_router(
         session_maker,

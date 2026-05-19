@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,7 @@ from kalshi_agent.config import Config
 from kalshi_agent.journal.logger import get_logger
 from kalshi_agent.safety.fees import edge_after_fees_dollars, total_fee_dollars
 from kalshi_agent.safety.kill_switch import KillSwitch
+from kalshi_agent.safety.pnl import realized_pnl_since
 from kalshi_agent.storage.models import Position
 
 log = get_logger(__name__)
@@ -89,34 +90,26 @@ class RiskMonitor:
                 return Decimal("0")
             return Decimal(p.avg_price_dollars) * Decimal(p.count)
 
-    def daily_realized_pnl_dollars(self) -> Decimal:
-        """Realized PnL since 00:00 in the display timezone (typically ET).
-
-        Uses the PnlDaily.realized_pnl snapshot taken at last midnight rollover
-        and subtracts it from the current sum-of-positions realized_pnl.
-        """
-        from datetime import datetime
-
-        from kalshi_agent.storage.models import PnlDaily
-
-        now_local = datetime.now(self._tz)
-        today = now_local.strftime("%Y-%m-%d")
-        yesterday = (now_local.replace(hour=12) - _ONE_DAY).strftime("%Y-%m-%d")
+    def _existing_position(self, ticker: str) -> Position | None:
         with self._sm() as s:
-            positions = s.scalars(select(Position)).all()
-            current_total = sum(
-                (Decimal(str(p.realized_pnl_dollars)) for p in positions),
-                Decimal("0"),
+            p = s.get(Position, ticker)
+            if p is None:
+                return None
+            return Position(
+                market_ticker=p.market_ticker,
+                side=p.side,
+                count=p.count,
+                avg_price_dollars=p.avg_price_dollars,
+                realized_pnl_dollars=p.realized_pnl_dollars,
+                updated_at=p.updated_at,
             )
-            # Baseline = realized total as of yesterday's snapshot, or 0 if none
-            base_row = s.get(PnlDaily, yesterday)
-            baseline = (
-                Decimal(str(base_row.realized_pnl)) if base_row else Decimal("0")
-            )
-            # Also subtract fees on today's fills not yet aggregated into positions
-            today_row = s.get(PnlDaily, today)
-            _ = today_row  # snapshot is informational only; live calc is from positions
-        return current_total - baseline
+
+    def daily_realized_pnl_dollars(self) -> Decimal:
+        """Realized PnL since local midnight using cumulative PnL snapshots."""
+        now_local = datetime.now(self._tz)
+        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        with self._sm() as s:
+            return realized_pnl_since(s, midnight_local.astimezone(UTC), self._tz)
 
     # ---- pre-trade check --------------------------------------------------
 
@@ -159,20 +152,42 @@ class RiskMonitor:
             )
             return RiskDecision(False, "max_daily_loss_exceeded")
 
-        # Total exposure
+        price = current_price
+        if price <= 0 or price >= 1:
+            return RiskDecision(False, "price_at_extremum")
+
+        existing = self._existing_position(market_ticker)
+        is_closing_buy = existing is not None and existing.count > 0 and existing.side != side
+
+        # Opposite-side buys close paired exposure. They must be allowed even
+        # when global/per-market exposure caps are full, but never let a close
+        # order exceed the contracts currently open or turn into a reversal.
+        if is_closing_buy:
+            contracts = min(existing.count, self._cfg.risk.per_order_max_contracts)
+            fees = total_fee_dollars(
+                contracts, price, is_taker=self._cfg.fees.assume_taker,
+                rate=Decimal(str(self._cfg.fees.taker_rate)),
+            )
+            close_edge = (Decimal("1") - Decimal(existing.avg_price_dollars) - price) * Decimal(contracts) - fees
+            return RiskDecision(
+                True,
+                None,
+                sized_contracts=contracts,
+                expected_fees_dollars=fees,
+                expected_edge_dollars=close_edge,
+            )
+
+        # Total exposure for new/opening exposure.
         total_exp = self.current_total_exposure_dollars()
         if total_exp >= Decimal(self._cfg.risk.max_total_exposure_usd):
             return RiskDecision(False, "max_total_exposure_exceeded")
 
         # Edge & sizing
         # Fractional Kelly on a binary contract:
-        #   f* = (p - price) / (1 - price)   when buying YES at `price` with prob p
-        # For NO side, mirror the math by treating the NO price as (1 - yes_price).
+        #   f* = (p - price) / (1 - price) when buying YES at `price` with prob p.
+        # For NO side, mirror the math by treating the NO probability as 1 - P(YES).
         p = model_probability if side == "yes" else (Decimal("1") - model_probability)
-        price = current_price
         denom = Decimal("1") - price
-        if denom <= 0:
-            return RiskDecision(False, "price_at_extremum")
         edge_per_dollar = p - price
         if edge_per_dollar <= 0:
             return RiskDecision(False, "no_edge")

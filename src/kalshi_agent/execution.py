@@ -16,7 +16,7 @@ from kalshi_agent.kalshi.client import KalshiAPIError, KalshiAuthError, KalshiCl
 from kalshi_agent.kalshi.types import OrderRequest, price_decimal_to_str, price_str_to_decimal
 from kalshi_agent.safety.reconciliation import Reconciler
 from kalshi_agent.safety.risk_monitor import RiskMonitor
-from kalshi_agent.storage.models import Decision, Order, Position
+from kalshi_agent.storage.models import Decision, Order
 from kalshi_agent.strategies.base import Signal
 
 log = get_logger(__name__)
@@ -63,18 +63,6 @@ class Executor:
             self._persist_decision(
                 signal, accepted=False,
                 reason=f"market_not_active:{market.status}",
-            )
-            return
-
-        # Anti-self-trade: if we already hold the opposite side, refuse to add more —
-        # the rational close is to buy the opposite, which the risk monitor will allow,
-        # but we don't open NEW exposure that would just lock in spread + fees.
-        with self._sm() as s:
-            existing = s.get(Position, signal.market_ticker)
-        if existing is not None and existing.count > 0 and existing.side != signal.side:
-            self._persist_decision(
-                signal, accepted=False,
-                reason=f"anti_self_trade:hold_{existing.side}_{existing.count}",
             )
             return
 

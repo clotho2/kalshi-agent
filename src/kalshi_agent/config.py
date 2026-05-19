@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -99,6 +99,7 @@ class StrategyConfig(BaseModel):
     # Both sub-configs are optional; the active strategy must have its block present.
     placeholder: PlaceholderStrategyConfig | None = None
     llm_assessor: LLMAssessorStrategyConfig | None = None
+    allow_placeholder_live: bool = False
 
 
 class LLMConfig(BaseModel):
@@ -154,6 +155,23 @@ class Config(BaseModel):
     strategy: StrategyConfig
     llm: LLMConfig = Field(default_factory=LLMConfig)
     secrets: Secrets
+
+    @model_validator(mode="after")
+    def _validate_strategy_mode(self) -> Config:
+        if self.strategy.active == "placeholder" and self.strategy.placeholder is None:
+            raise ValueError("strategy.placeholder block is required when active=placeholder")
+        if self.strategy.active == "llm_assessor" and self.strategy.llm_assessor is None:
+            raise ValueError("strategy.llm_assessor block is required when active=llm_assessor")
+        if (
+            self.mode == "live"
+            and self.strategy.active == "placeholder"
+            and not self.strategy.allow_placeholder_live
+        ):
+            raise ValueError(
+                "Refusing live mode with placeholder strategy. Set a real strategy or explicitly "
+                "set strategy.allow_placeholder_live=true for a deliberate smoke test."
+            )
+        return self
 
     @property
     def kalshi_base_url(self) -> str:
