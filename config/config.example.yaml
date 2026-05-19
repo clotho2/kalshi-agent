@@ -78,6 +78,9 @@ schedule:
 strategy:
   # active: placeholder | llm_assessor
   active: placeholder
+  # Placeholder is allowed in paper mode only by default. Live mode refuses to
+  # start with placeholder unless allow_placeholder_live is deliberately set true.
+  allow_placeholder_live: false
   placeholder:
     # Demo market to ping once per hour for pipeline validation
     test_ticker: INXD-26MAY16
