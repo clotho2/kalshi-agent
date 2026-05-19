@@ -22,7 +22,7 @@ produce signals. The downstream risk monitor still re-checks edge after fees.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -34,6 +34,8 @@ from kalshi_agent.kalshi.types import Market, price_str_to_decimal
 from kalshi_agent.llm.openrouter import OpenRouterClient, OpenRouterError
 from kalshi_agent.storage.models import Decision
 from kalshi_agent.strategies.base import Signal, Strategy
+
+UTC = timezone.utc
 
 log = get_logger(__name__)
 
@@ -196,7 +198,6 @@ class LLMMarketAssessor(Strategy):
 
         signals: list[Signal] = []
         for market in markets:
-            # Skip markets that fail manual-mode equivalents of discovery filters
             if (market.status or "").lower() not in {"active", "open"}:
                 continue
             if not market.yes_ask_dollars or not market.no_ask_dollars:
