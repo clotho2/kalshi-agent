@@ -18,6 +18,7 @@ from kalshi_agent.fills import FillIngestor
 from kalshi_agent.journal.discord import DiscordNotifier
 from kalshi_agent.journal.logger import get_logger
 from kalshi_agent.positions import snapshot_daily_pnl
+from kalshi_agent.safety.pnl import realized_pnl_since
 from kalshi_agent.safety.reconciliation import Reconciler
 from kalshi_agent.storage.models import Fill, Order, Position
 from kalshi_agent.strategies.base import Strategy
@@ -97,9 +98,11 @@ async def _post_summary(kind: str, discord, session_maker, tz) -> None:
             hour=0, minute=0, second=0, microsecond=0
         ).astimezone(UTC)
         label = now_local.strftime("%Y-%m-%d")
+        pnl_label = "realized pnl today"
     else:
         cutoff = (now_local - timedelta(days=7)).astimezone(UTC)
         label = f"week ending {now_local.strftime('%Y-%m-%d')}"
+        pnl_label = "realized pnl this week"
 
     with session_maker() as s:
         orders = s.scalars(select(Order).where(Order.created_at >= cutoff)).all()
@@ -107,20 +110,9 @@ async def _post_summary(kind: str, discord, session_maker, tz) -> None:
         open_positions = s.scalars(
             select(Position).where(Position.count != 0)
         ).all()
-        fees = sum(Decimal(f.fee_dollars) for f in fills) if fills else Decimal("0")
-        # Realized PnL in window: sum of position realized_pnl, minus what was
-        # already realized at window start. Use position-level realized as live source.
-        gross_pnl = sum(
-            (Decimal("1") - Decimal(f.price_dollars)) * Decimal(f.count)
-            - Decimal(f.price_dollars) * Decimal(f.count)
-            for f in fills if f.side == "yes" and False  # placeholder math noted
-        ) if False else Decimal("0")
-        realized_total = sum(
-            Decimal(str(p.realized_pnl_dollars)) for p in
-            s.scalars(select(Position)).all()
-        )
+        fees = sum((Decimal(f.fee_dollars) for f in fills), Decimal("0"))
+        net_pnl = realized_pnl_since(s, cutoff, tz)
 
-    net_pnl = realized_total  # realized_pnl already includes fees
     open_pos_str = ", ".join(
         f"{p.market_ticker}({p.side}×{p.count}@{p.avg_price_dollars})"
         for p in open_positions
@@ -130,7 +122,7 @@ async def _post_summary(kind: str, discord, session_maker, tz) -> None:
         f":calendar_spiral: **{kind.upper()} summary** ({label})\n"
         f"  orders: {len(orders)}  fills: {len(fills)}\n"
         f"  fees: ${fees:.4f}\n"
-        f"  realized pnl (cumulative): ${net_pnl:.4f}\n"
+        f"  {pnl_label}: ${net_pnl:.4f}\n"
         f"  open positions: {open_pos_str[:1500]}"
     )
     log.info(
