@@ -77,20 +77,18 @@ schedule:
 
 strategy:
   # active: placeholder | llm_assessor
-  active: placeholder
+  # The block matching `active` MUST be present; the other can be omitted.
+  active: llm_assessor
   # Placeholder is allowed in paper mode only by default. Live mode refuses to
   # start with placeholder unless allow_placeholder_live is deliberately set true.
   allow_placeholder_live: false
-  placeholder:
-    # Demo market to ping once per hour for pipeline validation
-    test_ticker: INXD-26MAY16
-    emit_interval_seconds: 3600
+
   llm_assessor:
     # Manual mode: list specific tickers here, only those are assessed.
-    # Auto-discovery mode: leave tickers empty, set `categories` instead.
+    # Auto-discovery mode (recommended): leave tickers empty, set `categories`.
     tickers: []
-    categories:                 # used when tickers is empty; falls back to
-      - economics               # markets.whitelist_categories if also empty
+    categories:                 # used when tickers is empty
+      - economics
       - kpi
     max_markets_per_tick: 20    # cap LLM calls per tick (cost control)
     min_volume_contracts: 100   # skip illiquid markets
@@ -100,6 +98,12 @@ strategy:
     min_confidence: 0.6         # require >=0.6 LLM confidence
     signal_ttl_minutes: 10
     min_seconds_between_signals_per_ticker: 1800
+
+  # Smoke-test strategy. Only used when `active: placeholder`.
+  # Emits one no-op signal/hour against `test_ticker` to validate the pipeline.
+  # placeholder:
+  #   test_ticker: KXPRES-28-DEM
+  #   emit_interval_seconds: 3600
 
 llm:
   base_url: https://openrouter.ai/api/v1
