@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,8 @@ from kalshi_agent.safety.pnl import realized_pnl_since
 from kalshi_agent.safety.reconciliation import Reconciler
 from kalshi_agent.storage.models import Fill, Order, Position
 from kalshi_agent.strategies.base import Strategy
+
+UTC = timezone.utc
 
 log = get_logger(__name__)
 
@@ -83,7 +85,6 @@ def build_scheduler(
     sched.add_job(_weekly_summary,
                   CronTrigger.from_crontab(config.schedule.weekly_summary_cron, timezone=tz),
                   id="weekly")
-    # Snapshot at 00:00 ET so daily_realized_pnl has a baseline for "today"
     sched.add_job(_midnight_snapshot,
                   CronTrigger(hour=0, minute=0, timezone=tz),
                   id="midnight_snapshot")
