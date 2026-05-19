@@ -6,7 +6,7 @@ Buy-only strategy: positions close either by buying the opposite side
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -21,6 +21,8 @@ from kalshi_agent.kalshi.types import (
 )
 from kalshi_agent.safety.fees import total_fee_dollars
 from kalshi_agent.storage.models import Fill, PnlDaily, Position
+
+UTC = timezone.utc
 
 log = get_logger(__name__)
 
@@ -45,8 +47,7 @@ def apply_fill(
     `total_fee_dollars` already applies the maker/taker split, so do not apply
     maker_taker_ratio a second time here.
     """
-    _ = maker_taker_ratio  # retained for API compatibility with callers/tests
-    # Duplicate-fill check
+    _ = maker_taker_ratio
     existing = session.scalars(
         select(Fill).where(
             Fill.kalshi_order_id == fill.order_id,
@@ -100,7 +101,6 @@ def apply_fill(
             pos.avg_price_dollars = price_decimal_to_str(new_total / Decimal(new_count))
             pos.count = new_count
         else:
-            # Buying opposite side closes pairs at guaranteed $1 settlement
             pair_count = min(pos.count, n)
             close_pnl_per = Decimal("1") - Decimal(pos.avg_price_dollars) - price
             realized += close_pnl_per * Decimal(pair_count)
@@ -112,7 +112,7 @@ def apply_fill(
                     pos.side = fill_side
                     pos.count = remainder
                     pos.avg_price_dollars = price_decimal_to_str(price)
-    else:  # sell
+    else:
         if pos.side != fill_side or pos.count == 0:
             log.warning("sell_without_position", ticker=fill.ticker, side=fill_side)
         else:
