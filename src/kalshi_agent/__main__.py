@@ -113,6 +113,10 @@ async def amain(args: argparse.Namespace) -> int:
             min_seconds_between_signals_per_ticker=la.min_seconds_between_signals_per_ticker,
         )
     else:
+        if not config.strategy.placeholder:
+            log.error("placeholder_config_missing")
+            await client_cm.__aexit__(None, None, None)
+            return 2
         strategy = PlaceholderStrategy(
             config.strategy.placeholder.test_ticker,
             config.strategy.placeholder.emit_interval_seconds,
