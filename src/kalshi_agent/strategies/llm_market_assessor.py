@@ -1,18 +1,23 @@
 """LLM-driven Kalshi market mispricing strategy.
 
-For each whitelisted market, we ask an LLM to estimate the true probability of
-YES given the market description, current price, and time-to-close. The LLM
-returns a structured response with `probability`, `confidence`, and `rationale`.
+Two modes:
+
+* **Auto-discovery (default)**: with `tickers=[]`, the strategy queries Kalshi's
+  open markets, filters by category whitelist, minimum volume, and minimum
+  time-to-close, then asks the LLM to assess each candidate. The set of markets
+  is rediscovered every tick — new markets get picked up automatically.
+
+* **Manual (legacy)**: with `tickers=[...]`, the strategy only assesses those
+  exact tickers. Useful for testing or pinning specific markets.
+
+Per-ticker throttling (`min_seconds_between_signals_per_ticker`) prevents
+re-running the LLM on the same ticker every minute regardless of mode.
 
 Only markets where:
-  - LLM probability differs from market mid by > min_edge_threshold
+  - LLM probability differs from market price by > min_edge
   - LLM confidence > min_confidence
-  - market is active and within trading hours
+  - market is active and has an ask price
 produce signals. The downstream risk monitor still re-checks edge after fees.
-
-This is a real, conservative strategy: it will produce few signals (most
-markets will fail the edge/confidence filter), but the ones it produces are
-informed by structured LLM reasoning rather than randomness or placeholders.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from sqlalchemy.orm import sessionmaker
 
 from kalshi_agent.journal.logger import get_logger
 from kalshi_agent.kalshi.client import KalshiAPIError, KalshiClient
-from kalshi_agent.kalshi.types import price_str_to_decimal
+from kalshi_agent.kalshi.types import Market, price_str_to_decimal
 from kalshi_agent.llm.openrouter import OpenRouterClient, OpenRouterError
 from kalshi_agent.storage.models import Decision
 from kalshi_agent.strategies.base import Signal, Strategy
@@ -44,49 +49,40 @@ a concrete, falsifiable reason the market is mispriced.
 
 Output strictly this JSON schema (no other keys, no commentary):
 {
-  "probability": 0.0..1.0,    // your point estimate of P(YES)
-  "confidence": 0.0..1.0,     // 0=no view, 1=very high conviction
-  "rationale": "string"        // 1-3 sentences explaining the reasoning
+  "probability": 0.0..1.0,
+  "confidence": 0.0..1.0,
+  "rationale": "string"
 }
 """
 
 
-def _user_prompt(
-    *,
-    ticker: str,
-    title: str,
-    subtitle: str | None,
-    description: str | None,
-    yes_bid: str | None,
-    yes_ask: str | None,
-    no_bid: str | None,
-    no_ask: str | None,
-    close_time: datetime | None,
-) -> str:
+def _user_prompt(market: Market) -> str:
     mid = None
-    if yes_bid and yes_ask:
-        mid = (price_str_to_decimal(yes_bid) + price_str_to_decimal(yes_ask)) / 2
+    if market.yes_bid_dollars and market.yes_ask_dollars:
+        mid = (price_str_to_decimal(market.yes_bid_dollars)
+               + price_str_to_decimal(market.yes_ask_dollars)) / 2
     time_to_close = ""
-    if close_time:
-        delta = close_time - datetime.now(UTC)
+    if market.close_time:
+        delta = market.close_time - datetime.now(UTC)
         if delta.total_seconds() > 0:
             hours = delta.total_seconds() / 3600
             time_to_close = f"\nTime until market close: {hours:.1f} hours"
-    return f"""Market ticker: {ticker}
-Title: {title}
-Subtitle: {subtitle or '(none)'}
-Description: {description or '(none)'}{time_to_close}
+    return f"""Market ticker: {market.ticker}
+Title: {market.title or market.ticker}
+Subtitle: {market.subtitle or '(none)'}
+Description: {market.description or '(none)'}
+Category: {market.category or '(none)'}{time_to_close}
 
 Current prices (decimal dollars, 0.0000 to 1.0000):
-  YES bid={yes_bid}  YES ask={yes_ask}
-  NO  bid={no_bid}   NO  ask={no_ask}
+  YES bid={market.yes_bid_dollars}  YES ask={market.yes_ask_dollars}
+  NO  bid={market.no_bid_dollars}   NO  ask={market.no_ask_dollars}
   YES mid={mid if mid is not None else 'unknown'}
 
 Estimate P(YES) and your confidence."""
 
 
 class LLMMarketAssessor(Strategy):
-    """Polls a list of tickers, asks the LLM to assess each, emits filtered signals."""
+    """Discovers candidate markets, asks an LLM to assess each, emits filtered signals."""
 
     name = "llm_market_assessor"
 
@@ -97,6 +93,11 @@ class LLMMarketAssessor(Strategy):
         llm_client: OpenRouterClient,
         session_maker: sessionmaker,
         tickers: list[str],
+        categories: list[str],
+        max_markets_per_tick: int,
+        min_volume_contracts: int,
+        min_hours_to_close: float,
+        discovery_max_pages: int,
         min_edge: Decimal,
         min_confidence: Decimal,
         signal_ttl_minutes: int,
@@ -106,6 +107,11 @@ class LLMMarketAssessor(Strategy):
         self._llm = llm_client
         self._sm = session_maker
         self._tickers = tickers
+        self._categories = [c.lower() for c in categories]
+        self._max_per_tick = max_markets_per_tick
+        self._min_volume = min_volume_contracts
+        self._min_hours_to_close = min_hours_to_close
+        self._discovery_max_pages = discovery_max_pages
         self._min_edge = min_edge
         self._min_confidence = min_confidence
         self._ttl = timedelta(minutes=signal_ttl_minutes)
@@ -124,17 +130,73 @@ class LLMMarketAssessor(Strategy):
             ).first()
         return row is not None
 
-    async def generate_signals(self) -> list[Signal]:
-        signals: list[Signal] = []
-        for ticker in self._tickers:
-            if self._was_recently_signalled(ticker):
-                continue
-            try:
-                market = await self._kalshi.get_market(ticker)
-            except KalshiAPIError as e:
-                log.warning("market_fetch_failed", ticker=ticker, error=str(e))
-                continue
+    def _passes_filters(self, m: Market, close_cutoff: datetime) -> bool:
+        if (m.status or "").lower() not in {"active", "open"}:
+            return False
+        if not m.yes_ask_dollars or not m.no_ask_dollars:
+            return False
+        if self._categories and (m.category or "").lower() not in self._categories:
+            return False
+        if m.volume is not None and m.volume < self._min_volume:
+            return False
+        if m.close_time and m.close_time < close_cutoff:
+            return False
+        return True
 
+    async def _discover(self) -> list[Market]:
+        """Scan open markets, return up to max_per_tick that pass filters and aren't throttled."""
+        close_cutoff = datetime.now(UTC) + timedelta(hours=self._min_hours_to_close)
+        candidates: list[Market] = []
+        cursor: str | None = None
+        for _ in range(self._discovery_max_pages):
+            try:
+                markets, cursor = await self._kalshi.list_markets(
+                    status="open", limit=200, cursor=cursor,
+                )
+            except KalshiAPIError as e:
+                log.warning("discovery_list_failed", error=str(e))
+                break
+            for m in markets:
+                if not self._passes_filters(m, close_cutoff):
+                    continue
+                if self._was_recently_signalled(m.ticker):
+                    continue
+                candidates.append(m)
+                if len(candidates) >= self._max_per_tick:
+                    log.info("discovery_done", scanned_pages_capped=True,
+                             candidates=len(candidates))
+                    return candidates
+            if not cursor:
+                break
+        log.info("discovery_done", scanned_pages_capped=False,
+                 candidates=len(candidates))
+        return candidates
+
+    async def _resolve_markets(self) -> list[Market]:
+        """If manual tickers given, fetch each; else discover."""
+        if self._tickers:
+            out: list[Market] = []
+            for t in self._tickers:
+                if self._was_recently_signalled(t):
+                    continue
+                try:
+                    m = await self._kalshi.get_market(t)
+                except KalshiAPIError as e:
+                    log.warning("market_fetch_failed", ticker=t, error=str(e))
+                    continue
+                out.append(m)
+            return out
+        return await self._discover()
+
+    async def generate_signals(self) -> list[Signal]:
+        markets = await self._resolve_markets()
+        if not markets:
+            return []
+        log.info("assessing_markets", count=len(markets))
+
+        signals: list[Signal] = []
+        for market in markets:
+            # Skip markets that fail manual-mode equivalents of discovery filters
             if (market.status or "").lower() not in {"active", "open"}:
                 continue
             if not market.yes_ask_dollars or not market.no_ask_dollars:
@@ -142,27 +204,11 @@ class LLMMarketAssessor(Strategy):
 
             yes_ask = price_str_to_decimal(market.yes_ask_dollars)
             no_ask = price_str_to_decimal(market.no_ask_dollars)
-            yes_mid = None
-            if market.yes_bid_dollars and market.yes_ask_dollars:
-                yes_mid = (price_str_to_decimal(market.yes_bid_dollars)
-                           + price_str_to_decimal(market.yes_ask_dollars)) / 2
-
-            prompt = _user_prompt(
-                ticker=ticker,
-                title=getattr(market, "title", None) or ticker,
-                subtitle=getattr(market, "subtitle", None),
-                description=getattr(market, "description", None),
-                yes_bid=market.yes_bid_dollars,
-                yes_ask=market.yes_ask_dollars,
-                no_bid=market.no_bid_dollars,
-                no_ask=market.no_ask_dollars,
-                close_time=market.close_time,
-            )
 
             try:
-                resp = await self._llm.chat_json(_SYSTEM_PROMPT, prompt)
+                resp = await self._llm.chat_json(_SYSTEM_PROMPT, _user_prompt(market))
             except OpenRouterError as e:
-                log.warning("llm_call_failed", ticker=ticker, error=str(e))
+                log.warning("llm_call_failed", ticker=market.ticker, error=str(e))
                 continue
 
             try:
@@ -170,36 +216,33 @@ class LLMMarketAssessor(Strategy):
                 conf = float(resp["confidence"])
                 rationale = str(resp.get("rationale", ""))[:500]
             except (KeyError, TypeError, ValueError) as e:
-                log.warning("llm_bad_schema", ticker=ticker, error=str(e), resp=resp)
+                log.warning("llm_bad_schema", ticker=market.ticker,
+                            error=str(e), resp=resp)
                 continue
             if not 0.0 <= prob <= 1.0 or not 0.0 <= conf <= 1.0:
                 continue
             if Decimal(str(conf)) < self._min_confidence:
                 continue
 
-            # Edge per side
             yes_edge = Decimal(str(prob)) - yes_ask
             no_edge = (Decimal("1") - Decimal(str(prob))) - no_ask
 
             if yes_edge >= self._min_edge and yes_edge >= no_edge:
                 signals.append(Signal(
-                    market_ticker=ticker,
-                    side="yes",
-                    model_probability=prob,
-                    confidence=conf,
+                    market_ticker=market.ticker, side="yes",
+                    model_probability=prob, confidence=conf,
                     rationale=rationale,
                     valid_until=datetime.now(UTC) + self._ttl,
                     strategy_name=self.name,
                 ))
             elif no_edge >= self._min_edge:
                 signals.append(Signal(
-                    market_ticker=ticker,
-                    side="no",
-                    model_probability=prob,
-                    confidence=conf,
+                    market_ticker=market.ticker, side="no",
+                    model_probability=prob, confidence=conf,
                     rationale=rationale,
                     valid_until=datetime.now(UTC) + self._ttl,
                     strategy_name=self.name,
                 ))
 
+        log.info("assessment_done", signals_emitted=len(signals))
         return signals

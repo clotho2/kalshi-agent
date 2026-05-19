@@ -171,6 +171,24 @@ class KalshiClient:
         data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data.get("market", data))
 
+    async def list_markets(
+        self,
+        *,
+        status: str = "open",
+        limit: int = 200,
+        cursor: str | None = None,
+        event_ticker: str | None = None,
+    ) -> tuple[list[Market], str | None]:
+        """Returns (markets, next_cursor). Pass next_cursor back in for pagination."""
+        params: dict = {"status": status, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        data = await self._request("GET", "/markets", params=params)
+        markets = [Market.model_validate(m) for m in data.get("markets", [])]
+        return markets, data.get("cursor")
+
     async def list_positions(self) -> list[KalshiPosition]:
         data = await self._request("GET", "/portfolio/positions")
         return [KalshiPosition.model_validate(p) for p in data.get("market_positions", [])]

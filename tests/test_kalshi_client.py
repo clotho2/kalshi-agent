@@ -93,6 +93,27 @@ async def test_rate_limit_429_then_success(rsa_private_key_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_markets_returns_paginated(rsa_private_key_path) -> None:
+    base = "https://demo-api.kalshi.co/trade-api/v2"
+    with respx.mock(base_url=base) as mock:
+        mock.get("/markets").mock(return_value=httpx.Response(200, json={
+            "markets": [
+                {"ticker": "A", "category": "economics", "status": "open",
+                 "yes_ask_dollars": "0.6500", "volume": 1000},
+                {"ticker": "B", "category": "kpi", "status": "open",
+                 "yes_ask_dollars": "0.4000", "volume": 500},
+            ],
+            "cursor": "next-page-token",
+        }))
+        async with KalshiClient(base, "key-id", rsa_private_key_path) as c:
+            markets, cursor = await c.list_markets(status="open", limit=200)
+    assert len(markets) == 2
+    assert markets[0].ticker == "A"
+    assert markets[0].volume == 1000
+    assert cursor == "next-page-token"
+
+
+@pytest.mark.asyncio
 async def test_create_order_sends_client_order_id(rsa_private_key_path) -> None:
     base = "https://demo-api.kalshi.co/trade-api/v2"
     captured: dict = {}

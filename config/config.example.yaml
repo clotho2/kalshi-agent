@@ -83,7 +83,16 @@ strategy:
     test_ticker: INXD-26MAY16
     emit_interval_seconds: 3600
   llm_assessor:
-    tickers: []                 # explicit allowlist of tickers to assess
+    # Manual mode: list specific tickers here, only those are assessed.
+    # Auto-discovery mode: leave tickers empty, set `categories` instead.
+    tickers: []
+    categories:                 # used when tickers is empty; falls back to
+      - economics               # markets.whitelist_categories if also empty
+      - kpi
+    max_markets_per_tick: 20    # cap LLM calls per tick (cost control)
+    min_volume_contracts: 100   # skip illiquid markets
+    min_hours_to_close: 2.0     # skip markets about to settle
+    discovery_max_pages: 5      # max pages of 200 to scan per discovery run
     min_edge: 0.04              # require >=4% edge before producing a signal
     min_confidence: 0.6         # require >=0.6 LLM confidence
     signal_ttl_minutes: 10

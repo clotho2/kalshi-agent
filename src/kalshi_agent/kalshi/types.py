@@ -39,6 +39,9 @@ class Market(BaseModel):
     no_ask_dollars: str | None = None
     last_price_dollars: str | None = None
     close_time: datetime | None = None
+    volume: int | None = None
+    open_interest: int | None = None
+    liquidity_dollars: str | None = None
 
 
 class OrderRequest(BaseModel):

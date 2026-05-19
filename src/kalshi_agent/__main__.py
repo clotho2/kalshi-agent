@@ -80,8 +80,14 @@ async def amain(args: argparse.Namespace) -> int:
             log.error("openrouter_api_key_missing")
             await client_cm.__aexit__(None, None, None)
             return 2
-        if not config.strategy.llm_assessor or not config.strategy.llm_assessor.tickers:
-            log.error("llm_assessor_tickers_empty")
+        if not config.strategy.llm_assessor:
+            log.error("llm_assessor_config_missing")
+            await client_cm.__aexit__(None, None, None)
+            return 2
+        la = config.strategy.llm_assessor
+        # Either manual tickers OR discovery categories must be provided
+        if not la.tickers and not la.categories:
+            log.error("llm_assessor_needs_tickers_or_categories")
             await client_cm.__aexit__(None, None, None)
             return 2
         llm_client_cm = OpenRouterClient(
@@ -95,13 +101,16 @@ async def amain(args: argparse.Namespace) -> int:
             kalshi_client=client,
             llm_client=llm_client,
             session_maker=sm,
-            tickers=config.strategy.llm_assessor.tickers,
-            min_edge=Decimal(str(config.strategy.llm_assessor.min_edge)),
-            min_confidence=Decimal(str(config.strategy.llm_assessor.min_confidence)),
-            signal_ttl_minutes=config.strategy.llm_assessor.signal_ttl_minutes,
-            min_seconds_between_signals_per_ticker=(
-                config.strategy.llm_assessor.min_seconds_between_signals_per_ticker
-            ),
+            tickers=la.tickers,
+            categories=la.categories or config.markets.whitelist_categories,
+            max_markets_per_tick=la.max_markets_per_tick,
+            min_volume_contracts=la.min_volume_contracts,
+            min_hours_to_close=la.min_hours_to_close,
+            discovery_max_pages=la.discovery_max_pages,
+            min_edge=Decimal(str(la.min_edge)),
+            min_confidence=Decimal(str(la.min_confidence)),
+            signal_ttl_minutes=la.signal_ttl_minutes,
+            min_seconds_between_signals_per_ticker=la.min_seconds_between_signals_per_ticker,
         )
     else:
         strategy = PlaceholderStrategy(

@@ -78,7 +78,16 @@ class PlaceholderStrategyConfig(BaseModel):
 
 
 class LLMAssessorStrategyConfig(BaseModel):
+    # If non-empty, manual override: only these tickers are assessed.
+    # If empty, the strategy auto-discovers from open markets.
     tickers: list[str] = Field(default_factory=list)
+    # Auto-discovery filters (used when `tickers` is empty)
+    categories: list[str] = Field(default_factory=list)
+    max_markets_per_tick: int = 20
+    min_volume_contracts: int = 100
+    min_hours_to_close: float = 2.0
+    discovery_max_pages: int = 5  # pages of 200 to scan per discovery call
+    # Common filters
     min_edge: float = 0.04
     min_confidence: float = 0.6
     signal_ttl_minutes: int = 10
