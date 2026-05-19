@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -13,6 +13,8 @@ from kalshi_agent.positions import apply_fill
 from kalshi_agent.safety.pnl import realized_pnl_since
 from kalshi_agent.safety.risk_monitor import RiskMonitor
 from kalshi_agent.storage.models import Fill, PnlDaily, Position
+
+UTC = timezone.utc
 
 
 def test_live_mode_refuses_placeholder_strategy_without_explicit_override(config) -> None:
