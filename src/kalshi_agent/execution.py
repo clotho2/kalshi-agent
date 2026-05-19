@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy.orm import sessionmaker
@@ -18,6 +18,8 @@ from kalshi_agent.safety.reconciliation import Reconciler
 from kalshi_agent.safety.risk_monitor import RiskMonitor
 from kalshi_agent.storage.models import Decision, Order
 from kalshi_agent.strategies.base import Signal
+
+UTC = timezone.utc
 
 log = get_logger(__name__)
 
@@ -58,7 +60,6 @@ class Executor:
             self._persist_decision(signal, accepted=False, reason=f"market_fetch_failed:{e}")
             return
 
-        # Market-status active check
         if (market.status or "").lower() not in {"active", "open"}:
             self._persist_decision(
                 signal, accepted=False,
@@ -66,10 +67,7 @@ class Executor:
             )
             return
 
-        if signal.side == "yes":
-            ask = market.yes_ask_dollars
-        else:
-            ask = market.no_ask_dollars
+        ask = market.yes_ask_dollars if signal.side == "yes" else market.no_ask_dollars
         if not ask:
             self._persist_decision(signal, accepted=False, reason="no_ask_price")
             return
@@ -95,7 +93,6 @@ class Executor:
             log.info("trade_rejected", ticker=signal.market_ticker, reason=decision.reason)
             return
 
-        # Final pre-flight: signal could have aged out while we did network IO
         if signal.is_expired():
             self._persist_decision(signal, accepted=False, reason="signal_expired_preflight")
             return
