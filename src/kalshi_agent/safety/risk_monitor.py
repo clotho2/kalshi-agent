@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -20,9 +20,9 @@ from kalshi_agent.safety.kill_switch import KillSwitch
 from kalshi_agent.safety.pnl import realized_pnl_since
 from kalshi_agent.storage.models import Position
 
-log = get_logger(__name__)
+UTC = timezone.utc
 
-_ONE_DAY = timedelta(days=1)
+log = get_logger(__name__)
 
 
 @dataclass
@@ -48,8 +48,6 @@ class RiskMonitor:
         self._error_timestamps: deque[float] = deque(maxlen=200)
         self._tz = ZoneInfo(config.schedule.display_timezone)
 
-    # ---- accounting helpers ------------------------------------------------
-
     def record_order_attempt(self) -> None:
         self._order_timestamps.append(time.monotonic())
 
@@ -72,8 +70,6 @@ class RiskMonitor:
                 source="risk_monitor",
                 payload={"errors": recent, "window_seconds": window},
             )
-
-    # ---- exposure / pnl from DB -------------------------------------------
 
     def current_total_exposure_dollars(self) -> Decimal:
         with self._sm() as s:
@@ -111,8 +107,6 @@ class RiskMonitor:
         with self._sm() as s:
             return realized_pnl_since(s, midnight_local.astimezone(UTC), self._tz)
 
-    # ---- pre-trade check --------------------------------------------------
-
     def check_trade(
         self,
         *,
@@ -127,7 +121,6 @@ class RiskMonitor:
         if self._kill.is_engaged():
             return RiskDecision(False, "kill_switch_engaged")
 
-        # Whitelist
         whitelist_cats = set(self._cfg.markets.whitelist_categories)
         whitelist_tix = set(self._cfg.markets.whitelist_tickers)
         if whitelist_tix and market_ticker not in whitelist_tix:
@@ -135,7 +128,6 @@ class RiskMonitor:
         if whitelist_cats and (market_category or "").lower() not in {c.lower() for c in whitelist_cats}:
             return RiskDecision(False, f"category_not_whitelisted:{market_category}")
 
-        # Order rate cap
         if self._orders_in_last_minute() >= self._cfg.risk.max_orders_per_minute:
             self._kill.engage(
                 "runaway_order_rate", source="risk_monitor",
@@ -143,7 +135,6 @@ class RiskMonitor:
             )
             return RiskDecision(False, "max_orders_per_minute_exceeded")
 
-        # Daily loss
         daily_pnl = self.daily_realized_pnl_dollars()
         if daily_pnl <= -Decimal(self._cfg.risk.max_daily_loss_usd):
             self._kill.engage(
@@ -159,9 +150,6 @@ class RiskMonitor:
         existing = self._existing_position(market_ticker)
         is_closing_buy = existing is not None and existing.count > 0 and existing.side != side
 
-        # Opposite-side buys close paired exposure. They must be allowed even
-        # when global/per-market exposure caps are full, but never let a close
-        # order exceed the contracts currently open or turn into a reversal.
         if is_closing_buy:
             contracts = min(existing.count, self._cfg.risk.per_order_max_contracts)
             fees = total_fee_dollars(
@@ -177,15 +165,10 @@ class RiskMonitor:
                 expected_edge_dollars=close_edge,
             )
 
-        # Total exposure for new/opening exposure.
         total_exp = self.current_total_exposure_dollars()
         if total_exp >= Decimal(self._cfg.risk.max_total_exposure_usd):
             return RiskDecision(False, "max_total_exposure_exceeded")
 
-        # Edge & sizing
-        # Fractional Kelly on a binary contract:
-        #   f* = (p - price) / (1 - price) when buying YES at `price` with prob p.
-        # For NO side, mirror the math by treating the NO probability as 1 - P(YES).
         p = model_probability if side == "yes" else (Decimal("1") - model_probability)
         denom = Decimal("1") - price
         edge_per_dollar = p - price
@@ -202,7 +185,6 @@ class RiskMonitor:
 
         size_dollars = kelly_capped * bankroll_dollars
 
-        # Cap by per-market remaining capacity
         per_market_cap = Decimal(self._cfg.risk.max_position_per_market_usd)
         used_for_market = self.current_position_exposure_dollars(market_ticker)
         remaining_for_market = per_market_cap - used_for_market
@@ -210,17 +192,14 @@ class RiskMonitor:
             return RiskDecision(False, "per_market_cap_full")
         size_dollars = min(size_dollars, remaining_for_market)
 
-        # Cap by remaining global exposure
         remaining_global = Decimal(self._cfg.risk.max_total_exposure_usd) - total_exp
         size_dollars = min(size_dollars, remaining_global)
 
-        # Convert to integer contract count
         contracts = int(size_dollars / price) if price > 0 else 0
         contracts = min(contracts, self._cfg.risk.per_order_max_contracts)
         if contracts <= 0:
             return RiskDecision(False, "size_below_one_contract")
 
-        # Edge check with fees
         fees = total_fee_dollars(
             contracts, price, is_taker=self._cfg.fees.assume_taker,
             rate=Decimal(str(self._cfg.fees.taker_rate)),
@@ -230,7 +209,6 @@ class RiskMonitor:
             is_taker=self._cfg.fees.assume_taker,
             rate=Decimal(str(self._cfg.fees.taker_rate)),
         )
-        # Express edge in bps relative to capital at risk for comparison.
         capital_at_risk = price * Decimal(contracts)
         if capital_at_risk <= 0:
             return RiskDecision(False, "zero_capital_at_risk")
@@ -248,8 +226,6 @@ class RiskMonitor:
             expected_fees_dollars=fees,
             expected_edge_dollars=edge,
         )
-
-    # ---- background loop --------------------------------------------------
 
     async def run_background(self, stop_event: asyncio.Event) -> None:
         """Periodically re-check global limits (post-hoc drift, error spikes)."""

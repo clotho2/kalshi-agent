@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,8 @@ from sqlalchemy.orm import sessionmaker
 
 from kalshi_agent.safety.pnl import cumulative_realized_pnl, realized_pnl_since
 from kalshi_agent.storage.models import Decision, Fill, Order, PnlDaily, Position
+
+UTC = timezone.utc
 
 
 def make_router(session_maker: sessionmaker, observer_auth, display_tz: str = "America/New_York") -> APIRouter:

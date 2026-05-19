@@ -7,7 +7,7 @@ latency optimization layered on top; polling is the source of truth.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -20,6 +20,8 @@ from kalshi_agent.kalshi.client import KalshiAPIError, KalshiClient
 from kalshi_agent.kalshi.types import price_str_to_decimal
 from kalshi_agent.positions import apply_fill
 from kalshi_agent.storage.models import Event, Fill, Order
+
+UTC = timezone.utc
 
 log = get_logger(__name__)
 
@@ -103,7 +105,6 @@ class FillIngestor:
                             f"{f.count} @ {price_str_to_decimal(f.yes_price_dollars or f.no_price_dollars or '0')} | "
                             f"realized {realized:+.4f}"
                         )
-                    # Update parent Order status if we can match it
                     parent = s.scalars(
                         select(Order).where(Order.kalshi_order_id == f.order_id)
                     ).first()
@@ -113,7 +114,7 @@ class FillIngestor:
             if not cursor:
                 break
         if max_ts_seen > (self._high_water_ts or 0):
-            self._high_water_ts = max_ts_seen + 1  # next poll starts after this
+            self._high_water_ts = max_ts_seen + 1
         return applied
 
     async def poll_loop(self, stop_event: asyncio.Event, interval_seconds: int) -> None:
