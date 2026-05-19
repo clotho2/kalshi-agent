@@ -41,9 +41,11 @@ def apply_fill(
 ) -> Decimal:
     """Apply a fill to the Position table. Returns realized PnL delta (signed).
 
-    Idempotent on (kalshi_order_id, trade_id) — duplicate fills are skipped.
+    Idempotent on the persisted fill identity tuple. Duplicate fills are skipped.
+    `total_fee_dollars` already applies the maker/taker split, so do not apply
+    maker_taker_ratio a second time here.
     """
-    fill_id = fill.trade_id or f"{fill.order_id}:{fill.count}:{fill.created_time}"
+    _ = maker_taker_ratio  # retained for API compatibility with callers/tests
     # Duplicate-fill check
     existing = session.scalars(
         select(Fill).where(
@@ -60,9 +62,6 @@ def apply_fill(
     fee = total_fee_dollars(
         fill.count, price, is_taker=fill.is_taker, rate=taker_rate
     )
-    if not fill.is_taker:
-        fee = fee * maker_taker_ratio / Decimal("0.25") * Decimal("0.25")
-        # taker_fee already returns taker; maker is 25% of that. total_fee_dollars handles it.
 
     session.add(Fill(
         kalshi_order_id=fill.order_id,
@@ -132,9 +131,9 @@ def apply_fill(
 def daily_realized_pnl(session: Session, day_local: str, tz: ZoneInfo) -> tuple[Decimal, Decimal, int]:
     """Sum realized PnL components for fills in `day_local` (YYYY-MM-DD in display tz).
 
-    Returns (realized_pnl_dollars, fees_dollars, fill_count). Realized PnL here is
-    approximate: net cash flow of fills (proceeds - cost - fees) on closed pairs.
-    Position-level realized_pnl is the source of truth; this is a fills-window slice.
+    Returns (realized_pnl_dollars, fees_dollars, fill_count). Realized PnL is
+    cumulative at the Position layer; callers that need period PnL should use
+    snapshot deltas from kalshi_agent.safety.pnl.
     """
     midnight_local = datetime.strptime(day_local, "%Y-%m-%d").replace(tzinfo=tz)
     next_midnight = midnight_local + timedelta(days=1)
@@ -148,10 +147,8 @@ def daily_realized_pnl(session: Session, day_local: str, tz: ZoneInfo) -> tuple[
 
 
 def snapshot_daily_pnl(session: Session, day_local: str, tz: ZoneInfo) -> PnlDaily:
-    """Snapshot today's totals into PnlDaily."""
+    """Snapshot today's cumulative realized PnL into PnlDaily."""
     _, fees, trade_count = daily_realized_pnl(session, day_local, tz)
-    # Realized PnL "today" = sum of position-level realized_pnl_dollars changes since midnight.
-    # Approximated as the sum of position realized_pnl (running total) — caller can diff snapshots.
     positions = session.scalars(select(Position)).all()
     realized_total = sum(p.realized_pnl_dollars for p in positions)
     row = session.get(PnlDaily, day_local) or PnlDaily(day=day_local)
