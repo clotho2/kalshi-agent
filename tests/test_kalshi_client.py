@@ -114,6 +114,98 @@ async def test_list_markets_returns_paginated(rsa_private_key_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_markets_backfills_category_from_event(rsa_private_key_path) -> None:
+    """Kalshi's /markets often returns category=null; client backfills from /events."""
+    base = "https://demo-api.kalshi.co/trade-api/v2"
+    with respx.mock(base_url=base) as mock:
+        mock.get("/markets").mock(return_value=httpx.Response(200, json={
+            "markets": [
+                {"ticker": "A", "event_ticker": "EV1", "category": None,
+                 "status": "open", "yes_ask_dollars": "0.6500", "volume": 1000},
+                {"ticker": "B", "event_ticker": "EV1",  # same event — cache hit
+                 "status": "open", "yes_ask_dollars": "0.4000", "volume": 500},
+                {"ticker": "C", "event_ticker": "EV2",
+                 "status": "open", "yes_ask_dollars": "0.5000", "volume": 200},
+            ],
+            "cursor": None,
+        }))
+        ev1 = mock.get("/events/EV1").mock(return_value=httpx.Response(200, json={
+            "event": {"event_ticker": "EV1", "category": "Economics"},
+        }))
+        ev2 = mock.get("/events/EV2").mock(return_value=httpx.Response(200, json={
+            "event": {"event_ticker": "EV2", "category": "KPI"},
+        }))
+        async with KalshiClient(base, "key-id", rsa_private_key_path) as c:
+            markets, _ = await c.list_markets(status="open", limit=200)
+            # Second call reuses cache — no new /events calls.
+            markets2, _ = await c.list_markets(status="open", limit=200)
+    by_ticker = {m.ticker: m for m in markets}
+    assert by_ticker["A"].category == "Economics"
+    assert by_ticker["B"].category == "Economics"
+    assert by_ticker["C"].category == "KPI"
+    assert ev1.call_count == 1  # batched per event_ticker within a single call
+    assert ev2.call_count == 1
+    assert {m.category for m in markets2} == {"Economics", "KPI"}
+
+
+@pytest.mark.asyncio
+async def test_list_markets_preserves_existing_category(rsa_private_key_path) -> None:
+    """If the markets endpoint already returns a category, don't touch /events.
+
+    We rely on respx: any unmocked request raises, so a stray /events call would
+    fail the test.
+    """
+    base = "https://demo-api.kalshi.co/trade-api/v2"
+    with respx.mock(base_url=base) as mock:
+        mock.get("/markets").mock(return_value=httpx.Response(200, json={
+            "markets": [
+                {"ticker": "A", "event_ticker": "EV1", "category": "Politics",
+                 "status": "open", "yes_ask_dollars": "0.5000"},
+            ],
+            "cursor": None,
+        }))
+        async with KalshiClient(base, "key-id", rsa_private_key_path) as c:
+            markets, _ = await c.list_markets(status="open", limit=200)
+    assert markets[0].category == "Politics"
+
+
+@pytest.mark.asyncio
+async def test_get_market_backfills_category(rsa_private_key_path) -> None:
+    base = "https://demo-api.kalshi.co/trade-api/v2"
+    with respx.mock(base_url=base) as mock:
+        mock.get("/markets/FOO").mock(return_value=httpx.Response(200, json={
+            "market": {
+                "ticker": "FOO", "event_ticker": "EVFOO",
+                "status": "active", "yes_ask_dollars": "0.6500",
+            },
+        }))
+        mock.get("/events/EVFOO").mock(return_value=httpx.Response(200, json={
+            "event": {"event_ticker": "EVFOO", "category": "Economics"},
+        }))
+        async with KalshiClient(base, "key-id", rsa_private_key_path) as c:
+            m = await c.get_market("FOO")
+    assert m.category == "Economics"
+
+
+@pytest.mark.asyncio
+async def test_list_markets_tolerates_event_lookup_failure(rsa_private_key_path) -> None:
+    """A failed /events lookup should not blow up discovery — category stays None."""
+    base = "https://demo-api.kalshi.co/trade-api/v2"
+    with respx.mock(base_url=base) as mock:
+        mock.get("/markets").mock(return_value=httpx.Response(200, json={
+            "markets": [
+                {"ticker": "A", "event_ticker": "EV-BAD",
+                 "status": "open", "yes_ask_dollars": "0.5000"},
+            ],
+            "cursor": None,
+        }))
+        mock.get("/events/EV-BAD").mock(return_value=httpx.Response(404, text="not found"))
+        async with KalshiClient(base, "key-id", rsa_private_key_path) as c:
+            markets, _ = await c.list_markets(status="open", limit=200)
+    assert markets[0].category is None
+
+
+@pytest.mark.asyncio
 async def test_create_order_sends_client_order_id(rsa_private_key_path) -> None:
     base = "https://demo-api.kalshi.co/trade-api/v2"
     captured: dict = {}

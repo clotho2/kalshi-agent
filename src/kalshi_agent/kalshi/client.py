@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from kalshi_agent.journal.logger import get_logger
 from kalshi_agent.kalshi.types import (
+    Event,
     KalshiBalance,
     KalshiFill,
     KalshiPosition,
@@ -100,6 +101,11 @@ class KalshiClient:
         self._write_bucket = TokenBucket(rate_limit_writes_per_second)
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        # event_ticker -> (category, expiry_monotonic). Category lives on the
+        # event in current Kalshi API versions; individual markets often have it
+        # null. We cache because categories don't change on settled events.
+        self._event_category_cache: dict[str, tuple[str | None, float]] = {}
+        self._event_category_ttl_seconds = 3600.0
 
     async def __aenter__(self) -> KalshiClient:
         self._client = httpx.AsyncClient(timeout=self._timeout)
@@ -169,7 +175,9 @@ class KalshiClient:
 
     async def get_market(self, ticker: str) -> Market:
         data = await self._request("GET", f"/markets/{ticker}")
-        return Market.model_validate(data.get("market", data))
+        market = Market.model_validate(data.get("market", data))
+        await self._enrich_categories([market])
+        return market
 
     async def list_markets(
         self,
@@ -179,7 +187,11 @@ class KalshiClient:
         cursor: str | None = None,
         event_ticker: str | None = None,
     ) -> tuple[list[Market], str | None]:
-        """Returns (markets, next_cursor). Pass next_cursor back in for pagination."""
+        """Returns (markets, next_cursor). Pass next_cursor back in for pagination.
+
+        Backfills `Market.category` from the parent event when the markets
+        endpoint omits it (common in current Kalshi API versions).
+        """
         params: dict = {"status": status, "limit": limit}
         if cursor:
             params["cursor"] = cursor
@@ -187,7 +199,39 @@ class KalshiClient:
             params["event_ticker"] = event_ticker
         data = await self._request("GET", "/markets", params=params)
         markets = [Market.model_validate(m) for m in data.get("markets", [])]
+        await self._enrich_categories(markets)
         return markets, data.get("cursor")
+
+    async def get_event(self, event_ticker: str) -> Event:
+        data = await self._request("GET", f"/events/{event_ticker}")
+        return Event.model_validate(data.get("event", data))
+
+    async def _enrich_categories(self, markets: list[Market]) -> None:
+        """For each market missing `category`, look it up on its event. Cached."""
+        now = time.monotonic()
+        needed: set[str] = set()
+        for m in markets:
+            if m.category or not m.event_ticker:
+                continue
+            cached = self._event_category_cache.get(m.event_ticker)
+            if cached is not None and cached[1] > now:
+                m.category = cached[0]
+                continue
+            needed.add(m.event_ticker)
+
+        for ev_ticker in needed:
+            try:
+                event = await self.get_event(ev_ticker)
+                category = event.category
+            except KalshiAPIError as e:
+                log.warning("event_lookup_failed", event_ticker=ev_ticker, error=str(e))
+                category = None
+            self._event_category_cache[ev_ticker] = (
+                category, now + self._event_category_ttl_seconds,
+            )
+            for m in markets:
+                if m.event_ticker == ev_ticker and not m.category:
+                    m.category = category
 
     async def list_positions(self) -> list[KalshiPosition]:
         data = await self._request("GET", "/portfolio/positions")
