@@ -24,6 +24,16 @@ Action = Literal["buy", "sell"]
 TimeInForce = Literal["GTC", "IOC", "FOK"]
 
 
+class Event(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    event_ticker: str
+    series_ticker: str | None = None
+    title: str | None = None
+    sub_title: str | None = None
+    category: str | None = None
+    mutually_exclusive: bool | None = None
+
+
 class Market(BaseModel):
     model_config = ConfigDict(extra="ignore")
     ticker: str

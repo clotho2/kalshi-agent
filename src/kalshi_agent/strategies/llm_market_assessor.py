@@ -132,24 +132,27 @@ class LLMMarketAssessor(Strategy):
             ).first()
         return row is not None
 
-    def _passes_filters(self, m: Market, close_cutoff: datetime) -> bool:
+    def _reject_reason(self, m: Market, close_cutoff: datetime) -> str | None:
+        """Returns a short reason string when the market fails filters, else None."""
         if (m.status or "").lower() not in {"active", "open"}:
-            return False
+            return f"status:{m.status or 'none'}"
         if not m.yes_ask_dollars or not m.no_ask_dollars:
-            return False
+            return "no_ask_price"
         if self._categories and (m.category or "").lower() not in self._categories:
-            return False
+            return f"category:{m.category or 'none'}"
         if m.volume is not None and m.volume < self._min_volume:
-            return False
+            return "low_volume"
         if m.close_time and m.close_time < close_cutoff:
-            return False
-        return True
+            return "imminent_close"
+        return None
 
     async def _discover(self) -> list[Market]:
         """Scan open markets, return up to max_per_tick that pass filters and aren't throttled."""
         close_cutoff = datetime.now(UTC) + timedelta(hours=self._min_hours_to_close)
         candidates: list[Market] = []
         cursor: str | None = None
+        scanned = 0
+        rejected: dict[str, int] = {}
         for _ in range(self._discovery_max_pages):
             try:
                 markets, cursor = await self._kalshi.list_markets(
@@ -159,19 +162,23 @@ class LLMMarketAssessor(Strategy):
                 log.warning("discovery_list_failed", error=str(e))
                 break
             for m in markets:
-                if not self._passes_filters(m, close_cutoff):
+                scanned += 1
+                reason = self._reject_reason(m, close_cutoff)
+                if reason is not None:
+                    rejected[reason] = rejected.get(reason, 0) + 1
                     continue
                 if self._was_recently_signalled(m.ticker):
+                    rejected["recently_signalled"] = rejected.get("recently_signalled", 0) + 1
                     continue
                 candidates.append(m)
                 if len(candidates) >= self._max_per_tick:
-                    log.info("discovery_done", scanned_pages_capped=True,
-                             candidates=len(candidates))
+                    log.info("discovery_done", scanned=scanned, candidates=len(candidates),
+                             rejected=rejected, scanned_pages_capped=True)
                     return candidates
             if not cursor:
                 break
-        log.info("discovery_done", scanned_pages_capped=False,
-                 candidates=len(candidates))
+        log.info("discovery_done", scanned=scanned, candidates=len(candidates),
+                 rejected=rejected, scanned_pages_capped=False)
         return candidates
 
     async def _resolve_markets(self) -> list[Market]:
