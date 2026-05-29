@@ -11,7 +11,7 @@ from pathlib import Path
 import uvicorn
 
 from kalshi_agent.bankroll import Bankroll
-from kalshi_agent.config import load_config
+from kalshi_agent.config import apply_test_mode, load_config
 from kalshi_agent.execution import Executor
 from kalshi_agent.fills import FillIngestor
 from kalshi_agent.journal.discord import DiscordNotifier
@@ -35,16 +35,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", required=True, type=Path)
     p.add_argument("--mode", choices=["paper", "live"], default=None,
                    help="override config mode")
+    p.add_argument("--test-mode", action="store_true",
+                   help="zero edge/confidence thresholds to exercise the full "
+                        "order pipeline end-to-end (paper/demo only)")
     return p.parse_args()
 
 
 async def amain(args: argparse.Namespace) -> int:
     config = load_config(args.config, mode_override=args.mode)
+    if args.test_mode:
+        apply_test_mode(config)
     configure_logging(config.journal.log_dir, config.journal.retention_days)
     log = get_logger("kalshi_agent.main")
 
     log.info("startup", mode=config.mode, base_url=config.kalshi_base_url,
-             strategy=config.strategy.active)
+             strategy=config.strategy.active, test_mode=args.test_mode)
+    if args.test_mode:
+        log.warning("test_mode_enabled",
+                    detail="edge/confidence thresholds zeroed; per-ticker "
+                           "throttle disabled — pipeline validation only")
 
     engine = make_engine(config.storage.db_path)
     init_db(engine)
@@ -95,6 +104,7 @@ async def amain(args: argparse.Namespace) -> int:
             model=config.llm.model,
             base_url=config.llm.base_url,
             timeout=config.llm.timeout_seconds,
+            min_request_interval=config.llm.request_interval_seconds,
         )
         llm_client = await llm_client_cm.__aenter__()
         strategy = LLMMarketAssessor(

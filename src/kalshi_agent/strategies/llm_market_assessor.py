@@ -204,10 +204,13 @@ class LLMMarketAssessor(Strategy):
         log.info("assessing_markets", count=len(markets))
 
         signals: list[Signal] = []
+        outcomes: dict[str, int] = {}
         for market in markets:
             if (market.status or "").lower() not in {"active", "open"}:
+                outcomes["not_active"] = outcomes.get("not_active", 0) + 1
                 continue
             if not market.yes_ask_dollars or not market.no_ask_dollars:
+                outcomes["no_ask_price"] = outcomes.get("no_ask_price", 0) + 1
                 continue
 
             yes_ask = price_str_to_decimal(market.yes_ask_dollars)
@@ -217,6 +220,7 @@ class LLMMarketAssessor(Strategy):
                 resp = await self._llm.chat_json(_SYSTEM_PROMPT, _user_prompt(market))
             except OpenRouterError as e:
                 log.warning("llm_call_failed", ticker=market.ticker, error=str(e))
+                outcomes["llm_call_failed"] = outcomes.get("llm_call_failed", 0) + 1
                 continue
 
             try:
@@ -226,31 +230,51 @@ class LLMMarketAssessor(Strategy):
             except (KeyError, TypeError, ValueError) as e:
                 log.warning("llm_bad_schema", ticker=market.ticker,
                             error=str(e), resp=resp)
-                continue
-            if not 0.0 <= prob <= 1.0 or not 0.0 <= conf <= 1.0:
-                continue
-            if Decimal(str(conf)) < self._min_confidence:
+                outcomes["bad_schema"] = outcomes.get("bad_schema", 0) + 1
                 continue
 
             yes_edge = Decimal(str(prob)) - yes_ask
             no_edge = (Decimal("1") - Decimal(str(prob))) - no_ask
 
-            if yes_edge >= self._min_edge and yes_edge >= no_edge:
-                signals.append(Signal(
-                    market_ticker=market.ticker, side="yes",
-                    model_probability=prob, confidence=conf,
-                    rationale=rationale,
-                    valid_until=datetime.now(UTC) + self._ttl,
-                    strategy_name=self.name,
-                ))
+            # Decide the outcome, then log every assessment so it's visible how
+            # close each market got and which gate (if any) stopped it.
+            side: str | None = None
+            decision: str
+            if not 0.0 <= prob <= 1.0 or not 0.0 <= conf <= 1.0:
+                decision = "out_of_range"
+            elif Decimal(str(conf)) < self._min_confidence:
+                decision = "below_confidence"
+            elif yes_edge >= self._min_edge and yes_edge >= no_edge:
+                decision, side = "signal_yes", "yes"
             elif no_edge >= self._min_edge:
+                decision, side = "signal_no", "no"
+            else:
+                decision = "below_edge"
+
+            outcomes[decision] = outcomes.get(decision, 0) + 1
+            log.info(
+                "market_assessed",
+                ticker=market.ticker,
+                decision=decision,
+                probability=round(prob, 4),
+                confidence=round(conf, 4),
+                yes_ask=str(yes_ask),
+                no_ask=str(no_ask),
+                yes_edge=str(round(yes_edge, 4)),
+                no_edge=str(round(no_edge, 4)),
+                min_edge=str(self._min_edge),
+                min_confidence=str(self._min_confidence),
+                rationale=rationale[:200],
+            )
+
+            if side is not None:
                 signals.append(Signal(
-                    market_ticker=market.ticker, side="no",
+                    market_ticker=market.ticker, side=side,
                     model_probability=prob, confidence=conf,
                     rationale=rationale,
                     valid_until=datetime.now(UTC) + self._ttl,
                     strategy_name=self.name,
                 ))
 
-        log.info("assessment_done", signals_emitted=len(signals))
+        log.info("assessment_done", signals_emitted=len(signals), outcomes=outcomes)
         return signals

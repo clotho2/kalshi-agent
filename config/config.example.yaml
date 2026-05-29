@@ -109,7 +109,12 @@ llm:
   base_url: https://openrouter.ai/api/v1
   # Any OpenRouter model id works (anthropic/claude-sonnet-4.6,
   # openai/gpt-5, google/gemini-2.5-pro, meta-llama/llama-4-405b, etc.)
+  # NOTE: avoid ":free" model variants here — they share a strict account-wide
+  # rate limit (429s) regardless of credit balance, and some free endpoints are
+  # slow enough to exceed timeout_seconds and return empty completions.
   model: anthropic/claude-sonnet-4.6
   temperature: 0.2
   max_tokens: 1024
   timeout_seconds: 60.0
+  # Minimum seconds between consecutive OpenRouter requests (rate-limit guard).
+  request_interval_seconds: 0.25
