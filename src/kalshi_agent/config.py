@@ -108,6 +108,10 @@ class LLMConfig(BaseModel):
     temperature: float = 0.2
     max_tokens: int = 1024
     timeout_seconds: float = 60.0
+    # Minimum gap between consecutive OpenRouter requests. A single strategy
+    # tick may assess many markets back-to-back; spacing them out avoids
+    # tripping provider rate limits (429s).
+    request_interval_seconds: float = 0.25
 
 
 class ScheduleConfig(BaseModel):

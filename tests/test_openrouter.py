@@ -85,3 +85,44 @@ async def test_4xx_raises_immediately() -> None:
         async with OpenRouterClient("sk-test", "model-x", base_url=base) as c:
             with pytest.raises(OpenRouterError):
                 await c.chat_json("sys", "user")
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_retries_then_raises() -> None:
+    """A 200 with no content (the slow/free-provider failure mode) is retried
+    within the error budget, then surfaces a descriptive error."""
+    base = "https://openrouter.ai/api/v1"
+    with respx.mock(base_url=base) as mock:
+        route = mock.post("/chat/completions").mock(return_value=_ok_response(""))
+        async with OpenRouterClient("sk-test", "model-x", base_url=base) as c:
+            with pytest.raises(OpenRouterError, match="empty completion"):
+                await c.chat_json("sys", "user", max_retries=2)
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_then_valid_succeeds() -> None:
+    base = "https://openrouter.ai/api/v1"
+    with respx.mock(base_url=base) as mock:
+        mock.post("/chat/completions").mock(side_effect=[
+            _ok_response(""),
+            _ok_response('{"probability": 0.4, "confidence": 0.7, "rationale": "r"}'),
+        ])
+        async with OpenRouterClient("sk-test", "model-x", base_url=base) as c:
+            res = await c.chat_json("sys", "user")
+    assert res["probability"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_429_has_separate_budget_from_errors() -> None:
+    """Repeated 429s must not be reported as an empty 'exhausted retries:'
+    message, and must exhaust the dedicated rate-limit budget."""
+    base = "https://openrouter.ai/api/v1"
+    with respx.mock(base_url=base) as mock:
+        route = mock.post("/chat/completions").mock(
+            return_value=httpx.Response(429, headers={"retry-after": "0.01"}, text="")
+        )
+        async with OpenRouterClient("sk-test", "model-x", base_url=base) as c:
+            with pytest.raises(OpenRouterError, match="429 rate limited"):
+                await c.chat_json("sys", "user", max_retries=3, max_rate_limit_retries=2)
+    assert route.call_count == 2

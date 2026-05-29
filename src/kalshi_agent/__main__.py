@@ -95,6 +95,7 @@ async def amain(args: argparse.Namespace) -> int:
             model=config.llm.model,
             base_url=config.llm.base_url,
             timeout=config.llm.timeout_seconds,
+            min_request_interval=config.llm.request_interval_seconds,
         )
         llm_client = await llm_client_cm.__aenter__()
         strategy = LLMMarketAssessor(
