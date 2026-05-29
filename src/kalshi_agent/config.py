@@ -192,3 +192,25 @@ def load_config(yaml_path: Path, mode_override: str | None = None) -> Config:
         raw["mode"] = mode_override
     raw["secrets"] = Secrets()
     return Config.model_validate(raw)
+
+
+def apply_test_mode(config: Config) -> Config:
+    """Zero the trading thresholds so the full pipeline (assess -> order ->
+    close) exercises end-to-end regardless of how conservative the LLM is.
+
+    Intended for validating the pipeline on the demo endpoint. Refuses live
+    mode, where zeroed thresholds would place real, unfiltered trades. Also
+    drops the per-ticker signal throttle so a held position can be re-assessed
+    every tick and flipped to a closing trade quickly.
+    """
+    if config.mode == "live":
+        raise ValueError(
+            "Refusing --test-mode in live mode: it zeroes the edge/confidence "
+            "risk thresholds, which is only safe against the demo endpoint."
+        )
+    config.risk.min_edge_after_fees_bps = 0
+    if config.strategy.llm_assessor is not None:
+        config.strategy.llm_assessor.min_confidence = 0.0
+        config.strategy.llm_assessor.min_edge = 0.0
+        config.strategy.llm_assessor.min_seconds_between_signals_per_ticker = 0
+    return config
