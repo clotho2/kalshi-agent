@@ -75,7 +75,7 @@ async def amain(args: argparse.Namespace) -> int:
     client = await client_cm.__aenter__()
 
     reconciler = Reconciler(client, sm, discord)
-    risk = RiskMonitor(config, kill, sm)
+    risk = RiskMonitor(config, kill, sm, test_mode=args.test_mode)
     bankroll = Bankroll(client, ttl_seconds=config.schedule.bankroll_ttl_seconds,
                         fallback_dollars=Decimal("0"))
     halt_monitor = HaltMonitor(kill, client, sm, discord)

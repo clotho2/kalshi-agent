@@ -40,10 +40,12 @@ class RiskMonitor:
         config: Config,
         kill_switch: KillSwitch,
         session_maker: sessionmaker,
+        test_mode: bool = False,
     ) -> None:
         self._cfg = config
         self._kill = kill_switch
         self._sm = session_maker
+        self._test_mode = test_mode
         self._order_timestamps: deque[float] = deque(maxlen=200)
         self._error_timestamps: deque[float] = deque(maxlen=200)
         self._tz = ZoneInfo(config.schedule.display_timezone)
@@ -169,6 +171,33 @@ class RiskMonitor:
         if total_exp >= Decimal(self._cfg.risk.max_total_exposure_usd):
             return RiskDecision(False, "max_total_exposure_exceeded")
 
+        per_market_cap = Decimal(self._cfg.risk.max_position_per_market_usd)
+        used_for_market = self.current_position_exposure_dollars(market_ticker)
+        if per_market_cap - used_for_market <= 0:
+            return RiskDecision(False, "per_market_cap_full")
+
+        if self._test_mode:
+            # Pipeline validation: force a minimal real order instead of the
+            # Kelly-sized amount (which rounds to zero for the low-confidence,
+            # tiny-edge estimates a conservative LLM produces). All the
+            # structural safety gates above still apply.
+            contracts = min(1, self._cfg.risk.per_order_max_contracts)
+            fees = total_fee_dollars(
+                contracts, price, is_taker=self._cfg.fees.assume_taker,
+                rate=Decimal(str(self._cfg.fees.taker_rate)),
+            )
+            edge = edge_after_fees_dollars(
+                contracts, model_probability, price, side,
+                is_taker=self._cfg.fees.assume_taker,
+                rate=Decimal(str(self._cfg.fees.taker_rate)),
+            )
+            return RiskDecision(
+                True, None,
+                sized_contracts=contracts,
+                expected_fees_dollars=fees,
+                expected_edge_dollars=edge,
+            )
+
         p = model_probability if side == "yes" else (Decimal("1") - model_probability)
         denom = Decimal("1") - price
         edge_per_dollar = p - price
@@ -185,12 +214,7 @@ class RiskMonitor:
 
         size_dollars = kelly_capped * bankroll_dollars
 
-        per_market_cap = Decimal(self._cfg.risk.max_position_per_market_usd)
-        used_for_market = self.current_position_exposure_dollars(market_ticker)
-        remaining_for_market = per_market_cap - used_for_market
-        if remaining_for_market <= 0:
-            return RiskDecision(False, "per_market_cap_full")
-        size_dollars = min(size_dollars, remaining_for_market)
+        size_dollars = min(size_dollars, per_market_cap - used_for_market)
 
         remaining_global = Decimal(self._cfg.risk.max_total_exposure_usd) - total_exp
         size_dollars = min(size_dollars, remaining_global)

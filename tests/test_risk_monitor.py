@@ -33,6 +33,34 @@ def test_passes_with_good_edge(config, kill_switch, db_session_maker) -> None:
     assert decision.sized_contracts > 0
 
 
+def test_test_mode_forces_one_contract_on_thin_edge(config, kill_switch, db_session_maker) -> None:
+    # Low confidence + tiny edge would normally round to zero contracts.
+    rm = RiskMonitor(config, kill_switch, db_session_maker, test_mode=True)
+    decision = _check(
+        rm,
+        model_probability=Decimal("0.5001"),
+        current_price=Decimal("0.50"),
+        confidence=Decimal("0.1"),
+    )
+    assert decision.allowed, decision.reason
+    assert decision.sized_contracts == 1
+
+
+def test_test_mode_still_rejects_price_extremum(config, kill_switch, db_session_maker) -> None:
+    rm = RiskMonitor(config, kill_switch, db_session_maker, test_mode=True)
+    decision = _check(rm, current_price=Decimal("0.0"))
+    assert not decision.allowed
+    assert decision.reason == "price_at_extremum"
+
+
+def test_test_mode_still_honors_kill_switch(config, kill_switch, db_session_maker) -> None:
+    rm = RiskMonitor(config, kill_switch, db_session_maker, test_mode=True)
+    kill_switch.engage("manual", source="test")
+    decision = _check(rm)
+    assert not decision.allowed
+    assert decision.reason == "kill_switch_engaged"
+
+
 def test_rejects_below_min_edge(config, kill_switch, db_session_maker) -> None:
     rm = _rm(config, kill_switch, db_session_maker)
     decision = _check(
